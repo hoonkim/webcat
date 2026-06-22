@@ -1,0 +1,137 @@
+use std::io::Write;
+use std::time::Duration;
+use futures::StreamExt;
+
+use crate::browser::Browser;
+use crate::config::Config;
+use crate::error::{Error, Result};
+use crate::geometry::{self, CellSize, GridSize};
+use crate::input::{InputMapper, Mode};
+use crate::input::action::Action;
+use crate::renderer::Renderer;
+use crate::terminal::input::{input_stream, RawInput};
+use crate::ui::Ui;
+
+pub async fn run(cfg: Config) -> Result<()> {
+    crate::terminal::raw::install_panic_and_signal_hooks();
+    let mut guard = crate::terminal::raw::RestoreGuard::enter()?;
+
+    if !crate::terminal::capability::detect_kitty_graphics(Duration::from_millis(300)) {
+        guard.restore();
+        return Err(Error::UnsupportedTerminal(
+            "Kitty graphics protocol not detected".into(),
+        ));
+    }
+
+    let cell_raw = crate::terminal::capability::query_cell_size(Duration::from_millis(300));
+    let (cols, rows) = crossterm::terminal::size()?;
+    let mut grid = GridSize { cols, rows };
+    let cell = CellSize { w: cell_raw.w, h: cell_raw.h };
+    let mut vp = geometry::page_viewport(grid, cell, 1);
+
+    let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
+    let (browser, mut frames) = Browser::launch(&cfg, chrome).await?;
+    browser.set_viewport(vp, cfg.dpr).await?;
+    browser.navigate(&cfg.start_url).await?;
+    browser.start_screencast(cfg.quality, vp).await?;
+
+    let mut renderer = Renderer::new(grid, cell);
+    let ui = Ui::new(grid);
+    let mut mapper = InputMapper::new(cell);
+    let mut url_buffer = String::new();
+
+    let mut inputs = Box::pin(input_stream());
+    let mut out = std::io::stdout();
+
+    loop {
+        tokio::select! {
+            // Frame branch: render the latest frame + status bar.
+            maybe = frames.recv() => {
+                let Some(f) = maybe else { break; };
+                out.write_all(&renderer.present_jpeg_bytes(&f.jpeg))?;
+                let url = browser.current_url().await.unwrap_or_default();
+                let status = match mapper.mode {
+                    Mode::Insert => format!("-- INSERT --  {url}"),
+                    _ => url.clone(),
+                };
+                out.write_all(&ui.status_bar(&status, false))?;
+                if mapper.mode == Mode::UrlInput {
+                    out.write_all(&ui.url_prompt(&url_buffer))?;
+                }
+                out.flush()?;
+            }
+
+            // Input branch: handle one event.
+            maybe = inputs.next() => {
+                let Some(ri) = maybe else { break; };
+                let action = match ri {
+                    RawInput::Key(ev) => mapper.on_key(ev),
+                    RawInput::Mouse(ev) => mapper.on_mouse(ev),
+                    RawInput::Resize => {
+                        let (c, r) = crossterm::terminal::size()?;
+                        grid = GridSize { cols: c, rows: r };
+                        vp = geometry::page_viewport(grid, cell, 1);
+                        renderer.resize(grid, cell);
+                        browser.set_viewport(vp, cfg.dpr).await?;
+                        Action::None
+                    }
+                };
+
+                match action {
+                    Action::Quit => break,
+                    Action::InsertText(t) => { let _ = browser.insert_text(&t).await; }
+                    Action::Key(k, m) => {
+                        let _ = browser.dispatch_key(k, m, true).await;
+                        let _ = browser.dispatch_key(k, m, false).await;
+                    }
+                    Action::ClickPixel { x, y, button } => { let _ = browser.click(x, y, button).await; }
+                    Action::ScrollPixel { x, y, dy } => { let _ = browser.scroll(x, y, dy).await; }
+                    Action::GoBack => browser.go_back().await,
+                    Action::Reload => browser.reload().await,
+                    // Mode switches are applied inside the mapper; the app just
+                    // acknowledges them (the status bar reflects mapper.mode).
+                    Action::EnterInsertMode => {}
+                    Action::ExitInsertMode => {}
+                    Action::EnterUrlMode => { url_buffer.clear(); }
+                    Action::UrlInputChar(s) => { url_buffer.push_str(&s); }
+                    Action::UrlBackspace => { url_buffer.pop(); }
+                    Action::UrlSubmit => {
+                        let target = normalize_url(&url_buffer);
+                        let _ = browser.navigate(&target).await;
+                        url_buffer.clear();
+                    }
+                    Action::UrlCancel => { url_buffer.clear(); }
+                    Action::EnterHintMode => { /* handled in Task 17 */ }
+                    Action::HintKey(_) => { /* handled in Task 17 */ }
+                    Action::None => {}
+                }
+            }
+        }
+    }
+
+    guard.restore();
+    Ok(())
+}
+
+fn normalize_url(input: &str) -> String {
+    let t = input.trim();
+    if t.contains("://") || t.starts_with("about:") {
+        t.to_string()
+    } else if t.contains('.') && !t.contains(' ') {
+        format!("https://{t}")
+    } else {
+        format!("https://www.google.com/search?q={}", urlencode(t))
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b' ' => "+".to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
