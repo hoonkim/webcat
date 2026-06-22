@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod geometry;
 mod renderer;
+mod terminal;
 
 use clap::Parser;
 
