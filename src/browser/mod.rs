@@ -9,6 +9,7 @@ use chromiumoxide::{Browser as CdpBrowser, BrowserConfig, Page};
 use chromiumoxide::cdp::browser_protocol::page::{
     StartScreencastParams, StartScreencastFormat, ScreencastFrameAckParams, EventScreencastFrame,
     NavigateParams,
+    EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType,
@@ -38,6 +39,8 @@ pub struct Browser {
     // unused directly but must not be dropped.
     #[allow(dead_code)]
     frame_tx: Arc<FrameTx>,
+    /// Signals false when the CDP handler task exits (true disconnect).
+    alive_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Browser {
@@ -56,6 +59,10 @@ impl Browser {
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
 
+        // Alive watch channel: starts true and flips false when the CDP handler
+        // task exits (i.e., Chrome disconnected).
+        let (alive_tx, alive_rx) = tokio::sync::watch::channel(true);
+
         // Drive the CDP handler in the background; if it ends, the browser is gone.
         // We must NOT break on errors: Chrome 149+ sends CDP events that older
         // chromiumoxide_cdp generated types cannot deserialize, returning transient
@@ -63,6 +70,8 @@ impl Browser {
         // handler loop alive.
         tokio::spawn(async move {
             while handler.next().await.is_some() {}
+            // Handler loop exited — true disconnect. Signal the alive watch.
+            let _ = alive_tx.send(false);
         });
 
         let page = Arc::new(
@@ -97,7 +106,26 @@ impl Browser {
             }
         });
 
-        Ok((Browser { _cdp: cdp, page, frame_tx }, rx))
+        // Auto-dismiss JS dialogs (alert/confirm/prompt) so they don't block rendering.
+        // HandleJavaScriptDialogParams::new(accept) is the direct constructor (0.7.0).
+        let dialog_page = page.clone();
+        tokio::spawn(async move {
+            if let Ok(mut ev) = dialog_page.event_listener::<EventJavascriptDialogOpening>().await {
+                while ev.next().await.is_some() {
+                    let _ = dialog_page
+                        .execute(HandleJavaScriptDialogParams::new(false))
+                        .await;
+                }
+            }
+        });
+
+        Ok((Browser { _cdp: cdp, page, frame_tx, alive_rx }, rx))
+    }
+
+    /// Returns a watch receiver that starts as `true` and flips to `false`
+    /// when the CDP handler task ends (Chrome disconnected or crashed).
+    pub fn alive(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.alive_rx.clone()
     }
 
     pub async fn navigate(&self, url: &str) -> Result<()> {

@@ -30,7 +30,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut vp = geometry::page_viewport(grid, cell, 1);
 
     let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
-    let (browser, mut frames) = Browser::launch(&cfg, chrome).await?;
+    let (mut browser, mut frames) = Browser::launch(&cfg, chrome).await?;
     browser.set_viewport(vp, cfg.dpr).await?;
     browser.navigate(&cfg.start_url).await?;
     browser.start_screencast(cfg.quality, vp).await?;
@@ -40,9 +40,16 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut mapper = InputMapper::new(cell);
     let mut url_buffer = String::new();
 
+    // Cached URL for status bar (avoids a per-frame round-trip to Chrome).
+    // Also used as last_url for reconnection.
+    let mut current_url = cfg.start_url.clone();
+
     let mut inputs = Box::pin(input_stream());
     let mut out = std::io::stdout();
     let mut hints: Vec<(String, crate::browser::Clickable)> = Vec::new();
+
+    // alive receiver — watch this for Chrome disconnect.
+    let mut browser_alive = browser.alive();
 
     loop {
         tokio::select! {
@@ -50,16 +57,58 @@ pub async fn run(cfg: Config) -> Result<()> {
             maybe = frames.recv() => {
                 let Some(f) = maybe else { break; };
                 out.write_all(&renderer.present_jpeg_bytes(&f.jpeg))?;
-                let url = browser.current_url().await.unwrap_or_default();
+                // Use cached current_url — no per-frame round-trip to Chrome.
                 let status = match mapper.mode {
-                    Mode::Insert => format!("-- INSERT --  {url}"),
-                    _ => url.clone(),
+                    Mode::Insert => format!("-- INSERT --  {current_url}"),
+                    _ => current_url.clone(),
                 };
                 out.write_all(&ui.status_bar(&status, false))?;
                 if mapper.mode == Mode::UrlInput {
                     out.write_all(&ui.url_prompt(&url_buffer))?;
                 }
                 out.flush()?;
+            }
+
+            // Alive branch: handle Chrome disconnect.
+            res = browser_alive.changed() => {
+                // changed() resolves when the value changes; an Err means the
+                // sender (alive_tx) was dropped, which is itself a disconnect.
+                let _ = res;
+                if !*browser_alive.borrow() {
+                    out.write_all(&ui.status_bar("disconnected — reconnecting…", true))?;
+                    out.flush()?;
+
+                    let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
+                    let mut reconnected = false;
+                    for attempt in 1u64..=3 {
+                        match Browser::launch(&cfg, chrome.clone()).await {
+                            Ok((nb, nf)) => {
+                                if nb.set_viewport(vp, cfg.dpr).await.is_ok()
+                                    && nb.navigate(&current_url).await.is_ok()
+                                    && nb.start_screencast(cfg.quality, vp).await.is_ok()
+                                {
+                                    browser_alive = nb.alive();
+                                    browser = nb;
+                                    frames = nf;
+                                    reconnected = true;
+                                    break;
+                                } else {
+                                    tracing::warn!("reconnect attempt {attempt}: post-launch setup failed");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("reconnect attempt {attempt} failed: {e}");
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+                    }
+
+                    if !reconnected {
+                        out.write_all(&ui.status_bar("browser unavailable (gave up after 3 tries)", false))?;
+                        out.flush()?;
+                        break;
+                    }
+                }
             }
 
             // Input branch: handle one event.
@@ -99,6 +148,8 @@ pub async fn run(cfg: Config) -> Result<()> {
                     Action::UrlSubmit => {
                         let target = normalize_url(&url_buffer);
                         let _ = browser.navigate(&target).await;
+                        // Update cached URL on successful submission.
+                        current_url = target;
                         url_buffer.clear();
                     }
                     Action::UrlCancel => { url_buffer.clear(); }
@@ -122,6 +173,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                     Action::HintKey(c) => {
                         if let Some((_, target)) = hints.iter().find(|(l, _)| l == &c.to_string()) {
                             let _ = browser.click(target.x, target.y, crate::terminal::mouse::MouseButton::Left).await;
+                            // Refresh URL after hint-based navigation (best-effort).
+                            if let Some(url) = browser.current_url().await {
+                                current_url = url;
+                            }
                         }
                         mapper.mode = crate::input::Mode::Normal;
                         hints.clear();
