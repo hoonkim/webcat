@@ -1724,6 +1724,7 @@ dependencies = [
  "futures",
  "image",
  "libc",
+ "serde_json",
  "signal-hook",
  "thiserror 1.0.69",
  "tokio",

@@ -16,6 +16,32 @@ pub fn hint_labels(n: usize) -> Vec<String> {
     }
 }
 
+use crate::browser::Clickable;
+
+pub fn assign(clickables: &[Clickable]) -> Vec<(String, Clickable)> {
+    let labels = hint_labels(clickables.len());
+    labels.into_iter().zip(clickables.iter().copied()).collect()
+}
+
+#[cfg(test)]
+mod assign_tests {
+    use super::*;
+    use crate::browser::Clickable;
+
+    #[test]
+    fn assigns_label_per_element() {
+        let cs = vec![
+            Clickable { x: 1.0, y: 2.0 },
+            Clickable { x: 3.0, y: 4.0 },
+        ];
+        let pairs = assign(&cs);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "a");
+        assert_eq!(pairs[1].0, "s");
+        assert_eq!(pairs[1].1.x, 3.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

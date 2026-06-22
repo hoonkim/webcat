@@ -42,6 +42,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let mut inputs = Box::pin(input_stream());
     let mut out = std::io::stdout();
+    let mut hints: Vec<(String, crate::browser::Clickable)> = Vec::new();
 
     loop {
         tokio::select! {
@@ -101,8 +102,30 @@ pub async fn run(cfg: Config) -> Result<()> {
                         url_buffer.clear();
                     }
                     Action::UrlCancel => { url_buffer.clear(); }
-                    Action::EnterHintMode => { /* handled in Task 17 */ }
-                    Action::HintKey(_) => { /* handled in Task 17 */ }
+                    Action::EnterHintMode => {
+                        let clickables = browser.collect_clickables().await.unwrap_or_default();
+                        if clickables.is_empty() {
+                            mapper.mode = crate::input::Mode::Normal;
+                            out.write_all(&ui.status_bar("(no clickable elements)", false))?;
+                            out.flush()?;
+                        } else {
+                            hints = crate::input::hints::assign(&clickables);
+                            let overlay: Vec<(String, u16, u16)> = hints.iter().map(|(label, c)| {
+                                let col = (c.x / cell.w as f64) as u16;
+                                let row = (c.y / cell.h as f64) as u16;
+                                (label.clone(), col, row)
+                            }).collect();
+                            out.write_all(&ui.hint_overlay(&overlay))?;
+                            out.flush()?;
+                        }
+                    }
+                    Action::HintKey(c) => {
+                        if let Some((_, target)) = hints.iter().find(|(l, _)| l == &c.to_string()) {
+                            let _ = browser.click(target.x, target.y, crate::terminal::mouse::MouseButton::Left).await;
+                        }
+                        mapper.mode = crate::input::Mode::Normal;
+                        hints.clear();
+                    }
                     Action::None => {}
                 }
             }

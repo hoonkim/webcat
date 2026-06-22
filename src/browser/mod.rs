@@ -25,6 +25,9 @@ use crate::terminal::keyboard::{Key, Mods};
 use crate::terminal::mouse::MouseButton;
 use frame::{Frame, FrameTx, FrameRx, frame_channel};
 
+#[derive(Debug, Clone, Copy)]
+pub struct Clickable { pub x: f64, pub y: f64 }
+
 pub struct Browser {
     // Owning the CdpBrowser keeps the headless Chromium child alive for the
     // controller's lifetime and ensures it is killed when Browser is dropped
@@ -197,6 +200,26 @@ impl Browser {
     pub async fn eval_string(&self, js: &str) -> Result<String> {
         let v = self.page.evaluate(js).await.map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
         Ok(v.into_value::<String>().unwrap_or_default())
+    }
+
+    pub async fn collect_clickables(&self) -> Result<Vec<Clickable>> {
+        let js = r#"
+            (() => {
+              const sel = 'a,button,input,textarea,select,[role=button],[onclick]';
+              const out = [];
+              for (const el of document.querySelectorAll(sel)) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0
+                    && r.top < innerHeight && r.left < innerWidth) {
+                  out.push([r.left + r.width/2, r.top + r.height/2]);
+                }
+              }
+              return JSON.stringify(out);
+            })()
+        "#;
+        let json = self.eval_string(js).await?;
+        let parsed: Vec<(f64, f64)> = serde_json::from_str(&json).unwrap_or_default();
+        Ok(parsed.into_iter().map(|(x, y)| Clickable { x, y }).collect())
     }
 }
 
