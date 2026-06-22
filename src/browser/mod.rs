@@ -145,9 +145,6 @@ impl Browser {
     }
 
     pub async fn go_back(&self) { let _ = self.page.evaluate("history.back()").await; }
-    // Reserved for forward-navigation keybinding (v2); no key is bound in v1.
-    #[allow(dead_code)]
-    pub async fn go_forward(&self) { let _ = self.page.evaluate("history.forward()").await; }
     pub async fn reload(&self) { let _ = self.page.reload().await; }
 
     pub async fn set_viewport(&self, vp: Viewport, dpr: f64) -> Result<()> {

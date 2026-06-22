@@ -14,11 +14,6 @@ pub enum Error {
     #[error("profile is locked by another webcat/chrome instance: {0}")]
     ProfileLocked(PathBuf),
 
-    // Reserved for structured reconnect error reporting (v2); not yet constructed.
-    #[allow(dead_code)]
-    #[error("browser disconnected")]
-    BrowserDisconnected,
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
