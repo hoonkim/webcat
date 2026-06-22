@@ -1642,6 +1642,10 @@ use crate::terminal::mouse::MouseButton;
 use frame::{Frame, FrameTx, FrameRx, frame_channel};
 
 pub struct Browser {
+    // Owning the CdpBrowser keeps the headless Chromium child alive for the
+    // controller's lifetime and ensures it is killed when Browser is dropped
+    // (satisfies the spec's "clean up Chromium on exit" requirement).
+    _cdp: CdpBrowser,
     page: Arc<Page>,
     frame_tx: Arc<FrameTx>,
 }
@@ -1676,9 +1680,6 @@ impl Browser {
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?,
         );
 
-        // Keep the Browser handle alive for the program's lifetime.
-        std::mem::forget(cdp);
-
         let (tx, rx) = frame_channel();
         let frame_tx = Arc::new(tx);
 
@@ -1702,7 +1703,7 @@ impl Browser {
             }
         });
 
-        Ok((Browser { page, frame_tx }, rx))
+        Ok((Browser { _cdp: cdp, page, frame_tx }, rx))
     }
 
     pub async fn navigate(&self, url: &str) -> Result<()> {
@@ -1971,6 +1972,8 @@ git commit -m "feat: milestone 2+3 — live screencast rendered to terminal"
         ClickPixel { x: f64, y: f64, button: crate::terminal::mouse::MouseButton },
         ScrollPixel { x: f64, y: f64, dy: f64 },
         EnterUrlMode,
+        EnterInsertMode,
+        ExitInsertMode,
         EnterHintMode,
         UrlInputChar(String),
         UrlBackspace,
@@ -1982,13 +1985,23 @@ git commit -m "feat: milestone 2+3 — live screencast rendered to terminal"
     }
     ```
   - `src/input/mod.rs`:
-    - `pub enum Mode { Normal, UrlInput, Hint }`
+    - `pub enum Mode { Normal, Insert, UrlInput, Hint }`
     - `pub struct InputMapper { pub mode: Mode, cell: CellSize }`
     - `InputMapper::new(cell: CellSize) -> Self`
     - `InputMapper::on_key(&mut self, ev: KeyEvent) -> Action`
     - `InputMapper::on_mouse(&mut self, ev: MouseEvent) -> Action`
 
-Key bindings (Normal mode): `:` → EnterUrlMode; `f` → EnterHintMode; `q` → Quit; `H` (shift+h) → GoBack; `r` → Reload; `j`/`k` → ScrollPixel (down/up by one line ~ 3*cell.h); arrow keys / printable chars → forwarded as `Key`/`InsertText`. In UrlInput mode: printable text (incl. Korean via `ev.text`) → UrlInputChar; Backspace → UrlBackspace; Enter → UrlSubmit; Esc → UrlCancel. In Hint mode: a-z char → HintKey; Esc → UrlCancel (reused to exit). Mouse (Normal): Down(Left) → ClickPixel; WheelUp/Down → ScrollPixel ±(3*cell.h).
+Modes follow vim conventions. **Normal mode is command-only — it never sends text to the page**; text entry (Korean and English) happens exclusively in **Insert mode**.
+
+Key bindings (Normal mode): `i` → EnterInsertMode; `:` → EnterUrlMode; `f` → EnterHintMode; `q` → Quit; `H` (shift+h) → GoBack; `r` → Reload; `j`/`k` → ScrollPixel (down/up by one line ~ 3*cell.h); arrow keys → forwarded as `Key`; any other printable char → `None` (commands only, no text leaks to the page).
+
+Insert mode: Esc → ExitInsertMode (back to Normal); Enter/Backspace/Tab/Delete/arrows → `Key`; any printable text (incl. Korean via `ev.text`) → `InsertText`.
+
+UrlInput mode: printable text (incl. Korean via `ev.text`) → UrlInputChar; Backspace → UrlBackspace; Enter → UrlSubmit; Esc → UrlCancel.
+
+Hint mode: a-z char → HintKey; Esc → UrlCancel (reused to exit).
+
+Mouse (any mode): Down(Left) → ClickPixel; WheelUp/Down → ScrollPixel ±(3*cell.h).
 
 - [ ] **Step 1: Write failing tests**
 
@@ -2026,13 +2039,30 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_korean_inserts_text() {
+    fn i_enters_insert_mode_and_korean_inserts_text() {
         let mut m = mapper();
+        assert!(matches!(m.on_key(ev(Key::Char('i'), Some("i"))), Action::EnterInsertMode));
+        assert!(matches!(m.mode, Mode::Insert));
         let a = m.on_key(ev(Key::Char('하'), Some("하세요")));
         match a {
             Action::InsertText(s) => assert_eq!(s, "하세요"),
             other => panic!("expected InsertText, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn normal_mode_does_not_leak_text_to_page() {
+        let mut m = mapper();
+        // A printable letter that is not a command must be swallowed in Normal mode.
+        assert!(matches!(m.on_key(ev(Key::Char('z'), Some("z"))), Action::None));
+    }
+
+    #[test]
+    fn esc_exits_insert_mode() {
+        let mut m = mapper();
+        m.on_key(ev(Key::Char('i'), Some("i")));
+        assert!(matches!(m.on_key(ev(Key::Esc, None)), Action::ExitInsertMode));
+        assert!(matches!(m.mode, Mode::Normal));
     }
 
     #[test]
@@ -2080,6 +2110,8 @@ pub enum Action {
     ClickPixel { x: f64, y: f64, button: MouseButton },
     ScrollPixel { x: f64, y: f64, dy: f64 },
     EnterUrlMode,
+    EnterInsertMode,
+    ExitInsertMode,
     EnterHintMode,
     UrlInputChar(String),
     UrlBackspace,
@@ -2103,7 +2135,7 @@ use crate::terminal::mouse::{MouseEvent, MouseKind, MouseButton};
 use action::Action;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode { Normal, UrlInput, Hint }
+pub enum Mode { Normal, Insert, UrlInput, Hint }
 
 pub struct InputMapper {
     pub mode: Mode,
@@ -2118,6 +2150,7 @@ impl InputMapper {
     pub fn on_key(&mut self, ev: KeyEvent) -> Action {
         match self.mode {
             Mode::Normal => self.on_key_normal(ev),
+            Mode::Insert => self.on_key_insert(ev),
             Mode::UrlInput => self.on_key_url(ev),
             Mode::Hint => self.on_key_hint(ev),
         }
@@ -2126,6 +2159,7 @@ impl InputMapper {
     fn on_key_normal(&mut self, ev: KeyEvent) -> Action {
         let line = 3.0 * self.cell.h as f64;
         match ev.key {
+            Key::Char('i') => { self.mode = Mode::Insert; Action::EnterInsertMode }
             Key::Char(':') => { self.mode = Mode::UrlInput; Action::EnterUrlMode }
             Key::Char('f') => { self.mode = Mode::Hint; Action::EnterHintMode }
             Key::Char('q') => Action::Quit,
@@ -2133,13 +2167,21 @@ impl InputMapper {
             Key::Char('H') => Action::GoBack,
             Key::Char('j') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: line },
             Key::Char('k') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: -line },
-            Key::Up | Key::Down | Key::Left | Key::Right
-            | Key::Enter | Key::Backspace | Key::Tab | Key::Delete => Action::Key(ev.key, ev.mods),
-            Key::Char(_) => {
+            Key::Up | Key::Down | Key::Left | Key::Right => Action::Key(ev.key, ev.mods),
+            // Normal mode is command-only: any other key (incl. printable text) is swallowed.
+            _ => Action::None,
+        }
+    }
+
+    fn on_key_insert(&mut self, ev: KeyEvent) -> Action {
+        match ev.key {
+            Key::Esc => { self.mode = Mode::Normal; Action::ExitInsertMode }
+            Key::Enter | Key::Backspace | Key::Tab | Key::Delete
+            | Key::Up | Key::Down | Key::Left | Key::Right => Action::Key(ev.key, ev.mods),
+            _ => {
                 // Printable text (incl. Korean) goes to the focused page element.
                 if let Some(t) = ev.text { Action::InsertText(t) } else { Action::None }
             }
-            _ => Action::None,
         }
     }
 
@@ -2582,7 +2624,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                 let Some(f) = maybe else { break; };
                 out.write_all(&renderer.present_jpeg_bytes(&f.jpeg))?;
                 let url = browser.current_url().await.unwrap_or_default();
-                out.write_all(&ui.status_bar(&url, false))?;
+                let status = match mapper.mode {
+                    Mode::Insert => format!("-- INSERT --  {url}"),
+                    _ => url.clone(),
+                };
+                out.write_all(&ui.status_bar(&status, false))?;
                 if mapper.mode == Mode::UrlInput {
                     out.write_all(&ui.url_prompt(&url_buffer))?;
                 }
@@ -2616,6 +2662,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                     Action::ScrollPixel { x, y, dy } => { let _ = browser.scroll(x, y, dy).await; }
                     Action::GoBack => browser.go_back().await,
                     Action::Reload => browser.reload().await,
+                    // Mode switches are applied inside the mapper; the app just
+                    // acknowledges them (the status bar reflects mapper.mode).
+                    Action::EnterInsertMode => {}
+                    Action::ExitInsertMode => {}
                     Action::EnterUrlMode => { url_buffer.clear(); }
                     Action::UrlInputChar(s) => { url_buffer.push_str(&s); }
                     Action::UrlBackspace => { url_buffer.pop(); }
@@ -2715,7 +2765,8 @@ Run: `cargo build && cargo run -- https://example.com`
 Expected:
 - Page renders and updates.
 - `j`/`k` and mouse wheel scroll; left-click follows links.
-- `:` opens the URL prompt; typing a URL + Enter navigates; **typing Korean into a page text field inserts Hangul correctly**.
+- `:` opens the URL prompt; typing a URL + Enter navigates.
+- Click into a page text field, press `i` (status shows `-- INSERT --`), **type Korean and verify Hangul inserts correctly**, then `Esc` returns to Normal.
 - `q` quits and the terminal is fully restored.
 
 - [ ] **Step 9: Commit**
@@ -2997,7 +3048,7 @@ git commit -m "feat: disconnect recovery, navigation error feedback, JS dialog a
 
 - [ ] **Step 1: Write `README.md`**
 
-Include: what webcat is; requirements (Kitty terminal, Chrome/Chromium installed); install/build (`cargo build --release`); usage (`webcat <url>`, flags `--profile-dir/--chrome/--quality/--dpr`, env vars `WEBCAT_CHROME/WEBCAT_PROFILE_DIR/WEBCAT_LOG/WEBCAT_LOG_LEVEL`); keybindings (`:` URL, `f` hints, `j/k` scroll, `H` back, `r` reload, `q` quit, mouse click/scroll); Korean input note (uses OS IME → committed text → `Input.insertText`); known limitations (single page/no tabs, single-letter hints, no in-field IME composition); where logs go.
+Include: what webcat is; requirements (Kitty terminal, Chrome/Chromium installed); install/build (`cargo build --release`); usage (`webcat <url>`, flags `--profile-dir/--chrome/--quality/--dpr`, env vars `WEBCAT_CHROME/WEBCAT_PROFILE_DIR/WEBCAT_LOG/WEBCAT_LOG_LEVEL`); keybindings (`i` insert mode / `Esc` normal mode, `:` URL, `f` hints, `j/k` scroll, `H` back, `r` reload, `q` quit, mouse click/scroll); the modal model (Normal = commands only, Insert = type into the focused field); Korean input note (enter Insert mode, then OS IME → committed text → `Input.insertText`); known limitations (single page/no tabs, single-letter hints, no in-field IME composition); where logs go.
 
 - [ ] **Step 2: Run the full unit suite**
 
@@ -3014,7 +3065,7 @@ Expected: clean. Remove any now-unnecessary `#[allow(dead_code)]`. Fix lints.
 Walk the full v1 acceptance checklist:
 - Open a real site, scroll (keys + wheel), click links, use `f` hints.
 - `:` navigate by typing a URL and by typing a search query.
-- Focus a text field and type **한글** (e.g. "안녕하세요") — verify it appears correctly in the field.
+- Focus a text field, press `i` for Insert mode, and type **한글** (e.g. "안녕하세요") — verify it appears correctly in the field; `Esc` back to Normal.
 - Resize the terminal — page reflows to the new size.
 - Quit with `q` and Ctrl-C — terminal fully restored both ways.
 
