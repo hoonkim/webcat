@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 use crate::geometry::CellSize;
 
@@ -14,28 +15,39 @@ pub fn parse_cell_size_report(seq: &str) -> Option<CellSize> {
     Some(CellSize { w, h })
 }
 
-/// Read available bytes from stdin until `terminator` byte or `timeout`.
+/// Read bytes from stdin until `terminator` or `timeout`, whichever first.
 ///
-/// IMPLEMENTER NOTE: raw mode must set `VMIN=0, VTIME=1` (crossterm raw mode
-/// does this by default on Unix) so the per-byte `read` returns quickly rather
-/// than blocking forever. If responses are flaky in manual testing, set the
-/// terminal to non-blocking explicitly; this is acceptable to adjust during the
-/// integration smoke.
+/// Sets the stdin fd to O_NONBLOCK for the duration so the deadline is
+/// enforceable regardless of the terminal's raw-mode VMIN/VTIME settings
+/// (crossterm's cfmakeraw uses VMIN=1/VTIME=0, i.e. a plain blocking read
+/// would otherwise hang forever on a terminal that never replies). The
+/// original fd flags are restored before returning.
 fn read_reply(terminator: u8, timeout: Duration) -> String {
-    let mut stdin = std::io::stdin();
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let orig_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if orig_flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags | libc::O_NONBLOCK); }
+    }
+    let mut handle = stdin.lock();
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        match stdin.read(&mut byte) {
-            Ok(1) => {
+        match handle.read(&mut byte) {
+            Ok(0) => std::thread::sleep(Duration::from_millis(1)), // no data yet; keep polling
+            Ok(_) => {
                 buf.push(byte[0]);
-                if byte[0] == terminator {
-                    break;
-                }
+                if byte[0] == terminator { break; }
             }
-            _ => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => break,
         }
+    }
+    if orig_flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, orig_flags); }
     }
     String::from_utf8_lossy(&buf).into_owned()
 }
@@ -57,7 +69,7 @@ pub fn detect_kitty_graphics(timeout: Duration) -> bool {
     let _ = write!(out, "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
     let _ = out.flush();
     let reply = read_reply(b'\\', timeout);
-    reply.contains("\x1b_G") && reply.contains("OK")
+    reply.contains("\x1b_G") && reply.contains(";OK")
 }
 
 #[cfg(test)]
