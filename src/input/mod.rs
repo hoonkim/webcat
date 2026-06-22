@@ -2,7 +2,7 @@ pub mod action;
 pub mod hints;
 
 use crate::geometry::{CellSize, cell_to_pixel};
-use crate::terminal::keyboard::{Key, KeyEvent, Mods};
+use crate::terminal::keyboard::{Key, KeyEvent};
 use crate::terminal::mouse::{MouseEvent, MouseKind, MouseButton};
 use action::Action;
 

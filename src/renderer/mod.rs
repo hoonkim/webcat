@@ -29,6 +29,8 @@ impl Renderer {
         out
     }
 
+    // Used in unit tests and reserved for explicit screen-clear on quit (v2).
+    #[allow(dead_code)]
     pub fn clear(&self) -> Vec<u8> {
         self.gfx.delete_all()
     }

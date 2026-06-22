@@ -2,12 +2,19 @@ use std::io::Write;
 use crate::error::Result;
 
 // Escape sequences for setup/teardown.
+// Used by enter() and emit_restore_escapes() (called from app.rs).
+// The integration test includes this file standalone and doesn't call enter(),
+// so these constants appear unused in that compilation unit.
+#[allow(dead_code)]
 const ENTER_ALT: &str = "\x1b[?1049h";
 const LEAVE_ALT: &str = "\x1b[?1049l";
+#[allow(dead_code)]
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
+#[allow(dead_code)]
 const KKBD_PUSH: &str = "\x1b[>1u";       // push kitty keyboard flags (disambiguate)
 const KKBD_POP: &str = "\x1b[<u";          // pop kitty keyboard flags
+#[allow(dead_code)]
 const MOUSE_ON: &str = "\x1b[?1003h\x1b[?1006h"; // any-event + SGR
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l";
 
@@ -16,6 +23,8 @@ pub struct RestoreGuard {
 }
 
 impl RestoreGuard {
+    // Called from app.rs; appears unused to integration test's standalone compile.
+    #[allow(dead_code)]
     pub fn enter() -> Result<RestoreGuard> {
         crossterm::terminal::enable_raw_mode()?;
         // Construct the guard before the fallible writes so an early return
@@ -48,6 +57,8 @@ impl Drop for RestoreGuard {
 }
 
 /// Best-effort terminal restoration on panic and on SIGINT/SIGTERM.
+// Called from app.rs; appears unused to integration test's standalone compile.
+#[allow(dead_code)]
 pub fn install_panic_and_signal_hooks() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -64,7 +75,7 @@ pub fn install_panic_and_signal_hooks() {
             Ok(s) => s,
             Err(_) => return,
         };
-        for _ in signals.forever() {
+        if signals.forever().next().is_some() {
             emit_restore_escapes();
             std::process::exit(130);
         }

@@ -49,6 +49,8 @@ impl KittyGraphics {
     }
 
     /// Delete the transmitted image (and its placements) by id.
+    // Called by Renderer::clear; also tested in unit tests.
+    #[allow(dead_code)]
     pub fn delete_all(&self) -> Vec<u8> {
         format!("\x1b_Ga=d,d=i,i={},q=2;\x1b\\", self.image_id).into_bytes()
     }

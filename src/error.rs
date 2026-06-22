@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    // Constructed in app.rs when detect_kitty_graphics returns false.
+    // (Integration test compiles this file standalone and won't see app.rs usage.)
+    #[allow(dead_code)]
     #[error("terminal is not Kitty-graphics capable: {0}")]
     UnsupportedTerminal(String),
 
@@ -11,6 +14,8 @@ pub enum Error {
     #[error("profile is locked by another webcat/chrome instance: {0}")]
     ProfileLocked(PathBuf),
 
+    // Reserved for structured reconnect error reporting (v2); not yet constructed.
+    #[allow(dead_code)]
     #[error("browser disconnected")]
     BrowserDisconnected,
 

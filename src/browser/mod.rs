@@ -26,6 +26,9 @@ use crate::terminal::keyboard::{Key, Mods};
 use crate::terminal::mouse::MouseButton;
 use frame::{Frame, FrameTx, FrameRx, frame_channel};
 
+// Constructed by collect_clickables (called from app.rs); integration test
+// includes this file standalone and doesn't call that path.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Clickable { pub x: f64, pub y: f64 }
 
@@ -40,9 +43,14 @@ pub struct Browser {
     #[allow(dead_code)]
     frame_tx: Arc<FrameTx>,
     /// Signals false when the CDP handler task exits (true disconnect).
+    // Read via alive() in app.rs; integration test doesn't call alive().
+    #[allow(dead_code)]
     alive_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+// Methods are called from app.rs; the integration test includes this file
+// standalone and only calls a subset, so the rest appear dead there.
+#[allow(dead_code)]
 impl Browser {
     pub async fn launch(cfg: &Config, chrome: PathBuf) -> Result<(Browser, FrameRx)> {
         profile::prepare_profile(&cfg.profile_dir)?;
@@ -137,6 +145,8 @@ impl Browser {
     }
 
     pub async fn go_back(&self) { let _ = self.page.evaluate("history.back()").await; }
+    // Reserved for forward-navigation keybinding (v2); no key is bound in v1.
+    #[allow(dead_code)]
     pub async fn go_forward(&self) { let _ = self.page.evaluate("history.forward()").await; }
     pub async fn reload(&self) { let _ = self.page.reload().await; }
 
@@ -251,6 +261,8 @@ impl Browser {
     }
 }
 
+// Called by dispatch_key; appears unused to integration test's standalone compile.
+#[allow(dead_code)]
 fn encode_mods(m: Mods) -> i64 {
     // CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
     let mut bits = 0i64;
@@ -262,6 +274,8 @@ fn encode_mods(m: Mods) -> i64 {
 }
 
 /// Map a Key to (windows virtual key code, optional text to emit).
+// Called by dispatch_key; appears unused to integration test's standalone compile.
+#[allow(dead_code)]
 fn key_to_cdp(key: Key) -> (i64, Option<String>) {
     match key {
         Key::Enter     => (13,  Some("\r".into())),

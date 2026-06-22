@@ -1,3 +1,7 @@
+// All variants are part of the keyboard protocol API; not all are produced by
+// the Kitty parser in v1, but they are matched in input/browser dispatch and
+// kept for completeness (additional key bindings in v2).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char), Enter, Backspace, Tab, Esc,

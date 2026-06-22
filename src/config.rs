@@ -2,6 +2,9 @@ use std::path::PathBuf;
 use crate::cli::Cli;
 use crate::error::Result;
 
+// Fields are read in app.rs; the integration test uses a struct literal and may
+// not read all fields, triggering dead_code in that compilation unit.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub profile_dir: PathBuf,

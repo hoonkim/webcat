@@ -22,6 +22,8 @@ pub fn parse_cell_size_report(seq: &str) -> Option<CellSize> {
 /// (crossterm's cfmakeraw uses VMIN=1/VTIME=0, i.e. a plain blocking read
 /// would otherwise hang forever on a terminal that never replies). The
 /// original fd flags are restored before returning.
+// Used by query_cell_size and detect_kitty_graphics (called from app.rs).
+#[allow(dead_code)]
 fn read_reply(terminator: u8, timeout: Duration) -> String {
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
@@ -52,6 +54,8 @@ fn read_reply(terminator: u8, timeout: Duration) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+// Called from app.rs; appears unused when the integration test includes this file standalone.
+#[allow(dead_code)]
 pub fn query_cell_size(timeout: Duration) -> CellSize {
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b[16t");
@@ -63,6 +67,8 @@ pub fn query_cell_size(timeout: Duration) -> CellSize {
     })
 }
 
+// Called from app.rs; appears unused when the integration test includes this file standalone.
+#[allow(dead_code)]
 pub fn detect_kitty_graphics(timeout: Duration) -> bool {
     let mut out = std::io::stdout();
     // Query action with a 1px base64 RGB pixel; Kitty replies with an APC ...;OK ST.

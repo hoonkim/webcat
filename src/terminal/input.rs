@@ -1,6 +1,9 @@
 use crate::terminal::keyboard::{parse_kitty_key, Key, KeyEvent, Mods};
 use crate::terminal::mouse::parse_sgr_mouse;
 
+// All variants are produced and consumed in app.rs; integration test compiles
+// this file standalone so some appear unused in that compilation unit.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum RawInput {
     Key(KeyEvent),
@@ -28,6 +31,8 @@ pub fn classify(seq: &str) -> Option<RawInput> {
     None
 }
 
+// Called from app.rs; appears unused to the integration test's standalone compile.
+#[allow(dead_code)]
 pub fn input_stream() -> impl futures::Stream<Item = RawInput> {
     use futures::stream::StreamExt;
     // Resize signals via crossterm's EventStream; key/mouse via raw byte reader on a blocking task.
@@ -71,6 +76,7 @@ pub fn input_stream() -> impl futures::Stream<Item = RawInput> {
 
 /// Split a raw byte chunk into individual sequences: each ESC-introduced control
 /// sequence (up to its final byte) and each run of plain UTF-8 text.
+#[allow(dead_code)]
 fn split_sequences(bytes: &[u8]) -> Vec<String> {
     let s = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
