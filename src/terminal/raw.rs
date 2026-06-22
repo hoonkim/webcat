@@ -18,10 +18,13 @@ pub struct RestoreGuard {
 impl RestoreGuard {
     pub fn enter() -> Result<RestoreGuard> {
         crossterm::terminal::enable_raw_mode()?;
+        // Construct the guard before the fallible writes so an early return
+        // (e.g. a failed escape write) still triggers Drop -> restore().
+        let guard = RestoreGuard { active: true };
         let mut out = std::io::stdout();
         write!(out, "{ENTER_ALT}{HIDE_CURSOR}{KKBD_PUSH}{MOUSE_ON}")?;
         out.flush()?;
-        Ok(RestoreGuard { active: true })
+        Ok(guard)
     }
 
     #[cfg(test)]
@@ -34,11 +37,7 @@ impl RestoreGuard {
             return;
         }
         self.active = false;
-        // Best-effort: ignore errors, emit teardown escapes, drop raw mode.
-        let mut out = std::io::stdout();
-        let _ = write!(out, "{MOUSE_OFF}{KKBD_POP}{SHOW_CURSOR}{LEAVE_ALT}");
-        let _ = out.flush();
-        let _ = crossterm::terminal::disable_raw_mode();
+        emit_restore_escapes();
     }
 }
 
