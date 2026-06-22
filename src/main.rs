@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod error;
 mod geometry;
+mod input;
 mod renderer;
 mod terminal;
 
