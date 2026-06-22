@@ -1,3 +1,4 @@
+mod browser;
 mod cli;
 mod config;
 mod error;
