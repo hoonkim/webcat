@@ -1,0 +1,51 @@
+// Run with: WEBCAT_ITEST=1 cargo test --test browser_integration -- --nocapture
+// Skipped unless WEBCAT_ITEST=1 and a chrome binary is discoverable.
+
+#[path = "../src/error.rs"] mod error;
+#[path = "../src/cli.rs"] mod cli;
+#[path = "../src/config.rs"] mod config;
+#[path = "../src/geometry.rs"] mod geometry;
+#[path = "../src/terminal/mod.rs"] mod terminal;
+#[path = "../src/browser/mod.rs"] mod browser;
+
+use std::time::Duration;
+
+fn itest_enabled() -> bool {
+    std::env::var("WEBCAT_ITEST").is_ok()
+}
+
+#[tokio::test]
+async fn navigate_and_screencast_and_korean_input() {
+    if !itest_enabled() { eprintln!("skipped (set WEBCAT_ITEST=1)"); return; }
+
+    let chrome = browser::profile::discover_chrome(None).expect("chrome");
+    let tmp = std::env::temp_dir().join(format!("webcat-itest-{}", std::process::id()));
+    let cfg = config::Config {
+        profile_dir: tmp.clone(),
+        chrome: Some(chrome.clone()),
+        log_path: tmp.join("log"),
+        quality: 70,
+        dpr: 1.0,
+        start_url: "about:blank".into(),
+    };
+
+    let (b, mut frames) = browser::Browser::launch(&cfg, chrome).await.expect("launch");
+    let vp = geometry::Viewport { width_px: 800, height_px: 600 };
+    b.set_viewport(vp, 1.0).await.unwrap();
+
+    // Page with a text input we can focus and type Korean into.
+    let html = "data:text/html,<input id=t autofocus>";
+    b.navigate(html).await.unwrap();
+
+    b.start_screencast(70, vp).await.unwrap();
+    // We should receive at least one frame within a few seconds.
+    let got = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await;
+    assert!(matches!(got, Ok(Some(_))), "expected a screencast frame");
+
+    // Korean round-trip via insertText.
+    b.insert_text("안녕하세요").await.unwrap();
+    let value = b.eval_string("document.getElementById('t').value").await.unwrap();
+    assert_eq!(value, "안녕하세요");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
