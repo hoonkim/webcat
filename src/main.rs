@@ -6,6 +6,7 @@ mod geometry;
 mod input;
 mod renderer;
 mod terminal;
+mod ui;
 
 use clap::Parser;
 
