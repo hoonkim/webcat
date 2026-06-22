@@ -51,12 +51,24 @@ pub async fn run(cfg: Config) -> Result<()> {
     // alive receiver — watch this for Chrome disconnect.
     let mut browser_alive = browser.alive();
 
+    // Frame counter for throttled URL refresh (every 30 frames).
+    let mut frame_count: u64 = 0;
+
     loop {
         tokio::select! {
             // Frame branch: render the latest frame + status bar.
             maybe = frames.recv() => {
                 let Some(f) = maybe else { break; };
                 out.write_all(&renderer.present_jpeg_bytes(&f.jpeg))?;
+                // Throttled URL refresh: poll Chrome every 30 frames to catch
+                // in-page navigation (link clicks, GoBack, JS redirects, etc.)
+                // without incurring a round-trip on every frame.
+                frame_count += 1;
+                if frame_count % 30 == 0 {
+                    if let Some(u) = browser.current_url().await {
+                        current_url = u;
+                    }
+                }
                 // Use cached current_url — no per-frame round-trip to Chrome.
                 let status = match mapper.mode {
                     Mode::Insert => format!("-- INSERT --  {current_url}"),
@@ -123,6 +135,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                         vp = geometry::page_viewport(grid, cell, 1);
                         renderer.resize(grid, cell);
                         browser.set_viewport(vp, cfg.dpr).await?;
+                        let _ = browser.start_screencast(cfg.quality, vp).await;
                         Action::None
                     }
                 };
