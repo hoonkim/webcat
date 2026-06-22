@@ -85,7 +85,7 @@ mod tests {
         let big = vec![0xABu8; 10_000];
         let out = payload_of(&g.transmit_and_place_jpeg(&big));
         let blocks = out.matches("\x1b_G").count();
-        assert!(blocks >= 4, "expected >=4 chunks, got {blocks}");
+        assert_eq!(blocks, 4, "expected exactly 4 chunks for 10000 bytes");
         // Control keys only on first block.
         assert_eq!(out.matches("f=100").count(), 1);
         // Every block except the last carries m=1; last carries m=0.
