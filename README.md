@@ -1,6 +1,8 @@
 # webcat
 
-A modal terminal web browser that renders web pages as JPEG screencasts from a headless Chromium instance and displays them in the terminal using the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). Keyboard and mouse input is forwarded to the browser via the Chrome DevTools Protocol (CDP). Korean and other IME-composed text is fully supported via `Input.insertText`.
+A modal terminal web browser. It drives a headless Chromium instance over the Chrome DevTools Protocol (CDP), receives the page as a JPEG screencast, and displays it in the terminal using the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). Korean and other IME-composed text is fully supported via `Input.insertText`.
+
+**How frames are displayed:** each JPEG frame is decoded to RGBA and the raw pixels are handed to Kitty through a POSIX **shared-memory** object (`f=32,t=s`) — only the tiny shm name travels through the terminal, never the pixels — so rendering stays smooth even at high resolution. The frame is sized to the page viewport (terminal cols×rows of cells) and placed 1:1, so it fills the window. (`--dpr` can render the page at a higher device resolution; the default of `1.0` matches Kitty's 1:1 pixel-to-cell mapping.)
 
 ---
 
@@ -37,7 +39,7 @@ Opens `URL` in the terminal browser. If no URL is given, opens `about:blank`.
 | `--profile-dir <PATH>` | Chrome user-data directory (default: `$XDG_DATA_HOME/webcat/profile`) |
 | `--chrome <PATH>` | Path to the Chrome/Chromium binary |
 | `--quality <1-100>` | JPEG screencast quality (default: 70) |
-| `--dpr <FLOAT>` | Device pixel ratio for HiDPI screens (default: 1.0) |
+| `--dpr <FLOAT>` | Render the page at this device-pixel ratio (default: 1.0; raise for sharper text on HiDPI, though the image may then overflow on some displays) |
 
 ### Environment variables
 
