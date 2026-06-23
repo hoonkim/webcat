@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::time::Duration;
-use futures::StreamExt;
 
 use crate::browser::Browser;
 use crate::config::Config;
@@ -50,12 +49,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Also used as last_url for reconnection.
     let mut current_url = cfg.start_url.clone();
 
-    let mut inputs = Box::pin(input_stream());
+    let mut inputs = input_stream();
     let mut out = std::io::stdout();
     let mut hints: Vec<(String, crate::browser::Clickable)> = Vec::new();
 
     // alive receiver — watch this for Chrome disconnect.
     let mut browser_alive = browser.alive();
+    // navigation counter — re-sync viewport + screencast after each page load.
+    let mut browser_nav = browser.navigated();
 
     // Frame counter for throttled URL refresh (every 30 frames).
     let mut frame_count: u64 = 0;
@@ -69,11 +70,28 @@ pub async fn run(cfg: Config) -> Result<()> {
     tokio::pin!(startup_resync);
     let mut resynced = false;
 
+    // Track the screencast frame size; when it changes (e.g. a video going
+    // fullscreen or other dynamic relayout that doesn't fire a load event), the
+    // capture no longer matches the viewport, so re-sync. Debounced so the
+    // restart-induced frames don't cause a loop.
+    let mut last_frame_dims: Option<(u32, u32)> = None;
+    let mut last_resync = std::time::Instant::now();
+
     loop {
         tokio::select! {
             // Frame branch: render the latest frame + status bar.
             maybe = frames.recv() => {
                 let Some(f) = maybe else { break; };
+                if let Some((fw, fh)) = jpeg_dims(&f.jpeg) {
+                    let changed = matches!(last_frame_dims, Some((lw, lh))
+                        if (fw as i64 - lw as i64).abs() > 16 || (fh as i64 - lh as i64).abs() > 16);
+                    last_frame_dims = Some((fw, fh));
+                    if changed && last_resync.elapsed() > Duration::from_millis(400) {
+                        last_resync = std::time::Instant::now();
+                        browser.set_viewport(vp, cfg.dpr).await?;
+                        let _ = browser.start_screencast(cfg.quality, dev).await;
+                    }
+                }
                 out.write_all(&renderer.present_jpeg_bytes(&f.jpeg))?;
                 // Throttled URL refresh: poll Chrome every 30 frames to catch
                 // in-page navigation (link clicks, GoBack, JS redirects, etc.)
@@ -115,6 +133,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                                     && nb.start_screencast(cfg.quality, dev).await.is_ok()
                                 {
                                     browser_alive = nb.alive();
+                                    browser_nav = nb.navigated();
                                     browser = nb;
                                     frames = nf;
                                     reconnected = true;
@@ -150,86 +169,144 @@ pub async fn run(cfg: Config) -> Result<()> {
                 let _ = browser.start_screencast(cfg.quality, dev).await;
             }
 
-            // Input branch: handle one event.
-            maybe = inputs.next() => {
-                let Some(ri) = maybe else { break; };
-                let action = match ri {
-                    RawInput::Key(ev) => mapper.on_key(ev),
-                    RawInput::Mouse(ev) => mapper.on_mouse(ev),
-                    RawInput::Resize => {
-                        let (c, r) = crossterm::terminal::size()?;
-                        grid = GridSize { cols: c, rows: r };
-                        vp = geometry::page_viewport(grid, cell, 1);
-                        dev = dev_viewport(vp, cfg.dpr);
-                        renderer.resize(grid, cell);
-                        browser.set_viewport(vp, cfg.dpr).await?;
-                        let _ = browser.start_screencast(cfg.quality, dev).await;
-                        Action::None
-                    }
-                };
+            // Re-sync after a navigation completes: the new page is otherwise
+            // captured at a transitional size, breaking the full-window fit.
+            res = browser_nav.changed() => {
+                if res.is_ok() {
+                    browser.set_viewport(vp, cfg.dpr).await?;
+                    let _ = browser.start_screencast(cfg.quality, dev).await;
+                }
+            }
 
-                match action {
-                    Action::Quit => break,
-                    Action::InsertText(t) => { let _ = browser.insert_text(&t).await; }
-                    Action::Key(k, m) => {
-                        let _ = browser.dispatch_key(k, m, true).await;
-                        let _ = browser.dispatch_key(k, m, false).await;
-                    }
-                    Action::ClickPixel { x, y, button } => { let _ = browser.click(x, y, button).await; }
-                    Action::ScrollPixel { x, y, dy } => { let _ = browser.scroll(x, y, dy).await; }
-                    Action::GoBack => browser.go_back().await,
-                    Action::Reload => browser.reload().await,
-                    // Mode switches are applied inside the mapper; the app just
-                    // acknowledges them (the status bar reflects mapper.mode).
-                    Action::EnterInsertMode => {}
-                    Action::ExitInsertMode => {}
-                    Action::EnterUrlMode => { url_buffer.clear(); }
-                    Action::UrlInputChar(s) => { url_buffer.push_str(&s); }
-                    Action::UrlBackspace => { url_buffer.pop(); }
-                    Action::UrlSubmit => {
-                        let target = normalize_url(&url_buffer);
-                        let _ = browser.navigate(&target).await;
-                        // Update cached URL on successful submission.
-                        current_url = target;
-                        url_buffer.clear();
-                    }
-                    Action::UrlCancel => { url_buffer.clear(); }
-                    Action::EnterHintMode => {
-                        let clickables = browser.collect_clickables().await.unwrap_or_default();
-                        if clickables.is_empty() {
-                            mapper.mode = crate::input::Mode::Normal;
-                            out.write_all(&ui.status_bar("(no clickable elements)", false))?;
-                            out.flush()?;
-                        } else {
-                            hints = crate::input::hints::assign(&clickables);
-                            let overlay: Vec<(String, u16, u16)> = hints.iter().map(|(label, c)| {
-                                let col = (c.x / cell.w as f64) as u16;
-                                let row = (c.y / cell.h as f64) as u16;
-                                (label.clone(), col, row)
-                            }).collect();
-                            out.write_all(&ui.hint_overlay(&overlay))?;
-                            out.flush()?;
+            // Input branch: drain the entire pending backlog in one iteration so
+            // a click is never starved behind a flood of mouse-move events (and
+            // interleaved frame renders). Mouse moves are coalesced to the latest
+            // and dispatched once per batch as a hover.
+            maybe = inputs.recv() => {
+                let Some(first) = maybe else { break; };
+                let mut batch = vec![first];
+                while let Ok(ev) = inputs.try_recv() {
+                    batch.push(ev);
+                    if batch.len() >= 512 { break; }
+                }
+
+                let mut pending_move: Option<(f64, f64)> = None;
+                let mut quit = false;
+                for ri in batch {
+                    let action = match ri {
+                        RawInput::Key(ev) => mapper.on_key(ev),
+                        RawInput::Mouse(ev) => mapper.on_mouse(ev),
+                        RawInput::Resize => {
+                            let (c, r) = crossterm::terminal::size()?;
+                            grid = GridSize { cols: c, rows: r };
+                            vp = geometry::page_viewport(grid, cell, 1);
+                            dev = dev_viewport(vp, cfg.dpr);
+                            renderer.resize(grid, cell);
+                            browser.set_viewport(vp, cfg.dpr).await?;
+                            let _ = browser.start_screencast(cfg.quality, dev).await;
+                            Action::None
                         }
-                    }
-                    Action::HintKey(c) => {
-                        if let Some((_, target)) = hints.iter().find(|(l, _)| l == &c.to_string()) {
-                            let _ = browser.click(target.x, target.y, crate::terminal::mouse::MouseButton::Left).await;
-                            // Refresh URL after hint-based navigation (best-effort).
-                            if let Some(url) = browser.current_url().await {
-                                current_url = url;
+                    };
+
+                    match action {
+                        Action::Quit => { quit = true; break; }
+                        // Coalesce hover moves; dispatched once after the batch.
+                        Action::MoveMouse { x, y } => { pending_move = Some((x, y)); }
+                        Action::InsertText(t) => { let _ = browser.insert_text(&t).await; }
+                        Action::Key(k, m) => {
+                            let _ = browser.dispatch_key(k, m, true).await;
+                            let _ = browser.dispatch_key(k, m, false).await;
+                        }
+                        Action::ClickPixel { x, y, button } => {
+                            // The click moves to its own point; drop a stale hover.
+                            pending_move = None;
+                            let _ = browser.click(x, y, button).await;
+                        }
+                        Action::ScrollPixel { x, y, dy } => { let _ = browser.scroll(x, y, dy).await; }
+                        Action::GoBack => browser.go_back().await,
+                        Action::Reload => browser.reload().await,
+                        // Mode switches are applied inside the mapper; the app just
+                        // acknowledges them (the status bar reflects mapper.mode).
+                        Action::EnterInsertMode => {}
+                        Action::ExitInsertMode => {}
+                        Action::EnterUrlMode => { url_buffer.clear(); }
+                        Action::UrlInputChar(s) => { url_buffer.push_str(&s); }
+                        Action::UrlBackspace => { url_buffer.pop(); }
+                        Action::UrlSubmit => {
+                            let target = normalize_url(&url_buffer);
+                            let _ = browser.navigate(&target).await;
+                            // Update cached URL on successful submission.
+                            current_url = target;
+                            url_buffer.clear();
+                        }
+                        Action::UrlCancel => { url_buffer.clear(); }
+                        Action::EnterHintMode => {
+                            let clickables = browser.collect_clickables().await.unwrap_or_default();
+                            if clickables.is_empty() {
+                                mapper.mode = crate::input::Mode::Normal;
+                                out.write_all(&ui.status_bar("(no clickable elements)", false))?;
+                                out.flush()?;
+                            } else {
+                                hints = crate::input::hints::assign(&clickables);
+                                let overlay: Vec<(String, u16, u16)> = hints.iter().map(|(label, c)| {
+                                    let col = (c.x / cell.w as f64) as u16;
+                                    let row = (c.y / cell.h as f64) as u16;
+                                    (label.clone(), col, row)
+                                }).collect();
+                                out.write_all(&ui.hint_overlay(&overlay))?;
+                                out.flush()?;
                             }
                         }
-                        mapper.mode = crate::input::Mode::Normal;
-                        hints.clear();
+                        Action::HintKey(c) => {
+                            if let Some((_, target)) = hints.iter().find(|(l, _)| l == &c.to_string()) {
+                                let _ = browser.click(target.x, target.y, crate::terminal::mouse::MouseButton::Left).await;
+                                // Refresh URL after hint-based navigation (best-effort).
+                                if let Some(url) = browser.current_url().await {
+                                    current_url = url;
+                                }
+                            }
+                            mapper.mode = crate::input::Mode::Normal;
+                            hints.clear();
+                        }
+                        Action::None => {}
                     }
-                    Action::None => {}
                 }
+
+                // Dispatch the coalesced hover move once per batch (enables :hover).
+                if let Some((x, y)) = pending_move {
+                    let _ = browser.move_mouse(x, y).await;
+                }
+                if quit { break; }
             }
         }
     }
 
     guard.restore();
     Ok(())
+}
+
+/// Read a JPEG's pixel dimensions from its SOF marker (to detect capture-size
+/// changes). Returns None if not a parseable JPEG.
+fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 9 < b.len() {
+        if b[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = b[i + 1];
+        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
+            let h = ((b[i + 5] as u32) << 8) | b[i + 6] as u32;
+            let w = ((b[i + 7] as u32) << 8) | b[i + 8] as u32;
+            return Some((w, h));
+        }
+        let len = ((b[i + 2] as usize) << 8) | b[i + 3] as usize;
+        i += 2 + len;
+    }
+    None
 }
 
 /// The page area in DEVICE pixels: logical viewport × dpr. Chrome renders at

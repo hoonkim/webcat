@@ -33,33 +33,43 @@ pub fn classify(seq: &str) -> Option<RawInput> {
 
 // Called from app.rs; appears unused to the integration test's standalone compile.
 #[allow(dead_code)]
-pub fn input_stream() -> impl futures::Stream<Item = RawInput> {
-    use futures::stream::StreamExt;
-    // Resize signals via crossterm's EventStream; key/mouse via raw byte reader on a blocking task.
+pub fn input_stream() -> tokio::sync::mpsc::UnboundedReceiver<RawInput> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RawInput>();
 
-    // Resize watcher.
+    // Resize watcher via SIGWINCH. We must NOT use crossterm's EventStream here:
+    // it reads the SAME stdin as the raw byte reader below, so the two would
+    // race for bytes and crossterm would silently consume (and discard) key and
+    // mouse sequences — causing dropped keystrokes and clicks. SIGWINCH does not
+    // touch stdin.
     let tx_resize = tx.clone();
-    tokio::spawn(async move {
-        let mut ev = crossterm::event::EventStream::new();
-        while let Some(Ok(e)) = ev.next().await {
-            if let crossterm::event::Event::Resize(_, _) = e {
-                let _ = tx_resize.send(RawInput::Resize);
+    std::thread::spawn(move || {
+        use signal_hook::consts::SIGWINCH;
+        use signal_hook::iterator::Signals;
+        if let Ok(mut signals) = Signals::new([SIGWINCH]) {
+            for _ in signals.forever() {
+                if tx_resize.send(RawInput::Resize).is_err() {
+                    break;
+                }
             }
         }
     });
 
-    // Raw byte reader.
+    // Raw byte reader. Bytes are accumulated in a persistent buffer and only
+    // COMPLETE tokens are drained each read; an escape sequence (or multibyte
+    // UTF-8 char) split across two reads stays buffered until the rest arrives.
+    // (A previous stateless splitter dropped sequences cut at a read boundary,
+    // which lost mouse clicks during high-volume motion reporting.)
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
+        let mut chunk = [0u8; 4096];
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
         loop {
-            match stdin.read(&mut buf) {
+            match stdin.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // Split the chunk into escape-delimited sequences and plain text.
-                    for seq in split_sequences(&buf[..n]) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    for seq in drain_tokens(&mut buf) {
                         if let Some(ri) = classify(&seq) {
                             if tx.send(ri).is_err() {
                                 return;
@@ -71,39 +81,68 @@ pub fn input_stream() -> impl futures::Stream<Item = RawInput> {
         }
     });
 
-    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+    rx
 }
 
-/// Split a raw byte chunk into individual sequences: each ESC-introduced control
-/// sequence (up to its final byte) and each run of plain UTF-8 text.
-#[allow(dead_code)]
-fn split_sequences(bytes: &[u8]) -> Vec<String> {
-    let s = String::from_utf8_lossy(bytes);
+/// Drain all COMPLETE tokens from `buf`, leaving any trailing incomplete escape
+/// sequence or partial UTF-8 character in place for the next read. A token is
+/// either a complete CSI sequence (`ESC [` … final byte `0x40..=0x7E`), a short
+/// `ESC <x>` escape, or a run of plain UTF-8 text.
+fn drain_tokens(buf: &mut Vec<u8>) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = s.chars().peekable();
-    let mut text = String::new();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if !text.is_empty() {
-                out.push(std::mem::take(&mut text));
+    let n = buf.len();
+    let mut i = 0;
+    while i < n {
+        if buf[i] == 0x1b {
+            if i + 1 >= n {
+                break; // lone ESC at end — wait for more
             }
-            let mut esc = String::from(c);
-            // Consume until a plausible terminator (u, M, m, t, letter, or ST).
-            while let Some(&n) = chars.peek() {
-                esc.push(n);
-                chars.next();
-                if matches!(n, 'u' | 'M' | 'm' | 't' | '\\') || n.is_ascii_alphabetic() {
-                    break;
+            if buf[i + 1] == b'[' {
+                // CSI: scan to the final byte in 0x40..=0x7E.
+                let mut j = i + 2;
+                while j < n && !(0x40..=0x7e).contains(&buf[j]) {
+                    j += 1;
+                }
+                if j < n {
+                    out.push(String::from_utf8_lossy(&buf[i..=j]).into_owned());
+                    i = j + 1;
+                } else {
+                    break; // incomplete CSI — keep for next read
+                }
+            } else {
+                // Other ESC-prefixed escape: emit ESC + the following byte.
+                out.push(String::from_utf8_lossy(&buf[i..i + 2]).into_owned());
+                i += 2;
+            }
+        } else {
+            // Plain text run up to the next ESC.
+            let mut j = i;
+            while j < n && buf[j] != 0x1b {
+                j += 1;
+            }
+            match std::str::from_utf8(&buf[i..j]) {
+                Ok(s) => {
+                    out.push(s.to_string());
+                    i = j;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        out.push(String::from_utf8_lossy(&buf[i..i + valid]).into_owned());
+                    }
+                    if j == n {
+                        // Trailing bytes are an incomplete UTF-8 char — keep them.
+                        i += valid;
+                        break;
+                    } else {
+                        // Invalid bytes mid-buffer (not a split char): skip past them.
+                        i = j;
+                    }
                 }
             }
-            out.push(esc);
-        } else {
-            text.push(c);
         }
     }
-    if !text.is_empty() {
-        out.push(text);
-    }
+    buf.drain(..i);
     out
 }
 
@@ -131,5 +170,49 @@ mod tests {
             RawInput::Key(ev) => assert_eq!(ev.text.as_deref(), Some("가")),
             _ => panic!("expected key with text"),
         }
+    }
+
+    #[test]
+    fn drain_extracts_complete_sequences() {
+        let mut buf = b"\x1b[<0;5;9M\x1b[105u".to_vec();
+        let toks = drain_tokens(&mut buf);
+        assert_eq!(toks, vec!["\x1b[<0;5;9M".to_string(), "\x1b[105u".to_string()]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_keeps_sequence_split_across_reads() {
+        // First read ends mid-SGR-mouse sequence (no final byte yet).
+        let mut buf = b"\x1b[<0;20;1".to_vec();
+        let toks = drain_tokens(&mut buf);
+        assert!(toks.is_empty(), "incomplete CSI must not be emitted");
+        assert_eq!(buf, b"\x1b[<0;20;1", "incomplete CSI is kept buffered");
+        // Second read brings the rest; now the full sequence is emitted.
+        buf.extend_from_slice(b"2M");
+        let toks = drain_tokens(&mut buf);
+        assert_eq!(toks, vec!["\x1b[<0;20;12M".to_string()]);
+        assert!(buf.is_empty());
+        // And it classifies as a mouse Down (not lost, not a stray key).
+        assert!(matches!(classify(&toks[0]), Some(RawInput::Mouse(_))));
+    }
+
+    #[test]
+    fn drain_keeps_partial_utf8_across_reads() {
+        // '가' is 3 bytes (EA B0 80); split after the first byte.
+        let full = "가".as_bytes();
+        let mut buf = full[..1].to_vec();
+        let toks = drain_tokens(&mut buf);
+        assert!(toks.is_empty(), "partial UTF-8 must not be emitted");
+        buf.extend_from_slice(&full[1..]);
+        let toks = drain_tokens(&mut buf);
+        assert_eq!(toks, vec!["가".to_string()]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_handles_text_then_escape() {
+        let mut buf = b"ab\x1b[97u".to_vec();
+        let toks = drain_tokens(&mut buf);
+        assert_eq!(toks, vec!["ab".to_string(), "\x1b[97u".to_string()]);
     }
 }

@@ -27,7 +27,11 @@ fn main() -> anyhow::Result<()> {
         .with_writer(file)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("WEBCAT_LOG_LEVEL")
-                .unwrap_or_else(|_| "info".into()),
+                // Chrome 149 emits CDP messages chromiumoxide 0.7.0 can't
+                // deserialize; its connection layer logs one error per message,
+                // flooding the log. They're harmless (we ignore them), so
+                // silence those two modules by default.
+                .unwrap_or_else(|_| "info,chromiumoxide::conn=off,chromiumoxide::handler=off".into()),
         )
         .init();
 

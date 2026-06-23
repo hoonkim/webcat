@@ -9,7 +9,7 @@ use chromiumoxide::{Browser as CdpBrowser, BrowserConfig, Page};
 use chromiumoxide::cdp::browser_protocol::page::{
     StartScreencastParams, StartScreencastFormat, ScreencastFrameAckParams, EventScreencastFrame,
     NavigateParams,
-    EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
+    EventJavascriptDialogOpening, HandleJavaScriptDialogParams, EventLoadEventFired,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType,
@@ -46,6 +46,9 @@ pub struct Browser {
     // Read via alive() in app.rs; integration test doesn't call alive().
     #[allow(dead_code)]
     alive_rx: tokio::sync::watch::Receiver<bool>,
+    /// Increments on each page load so the app can re-sync after navigation.
+    #[allow(dead_code)]
+    nav_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 // Methods are called from app.rs; the integration test includes this file
@@ -134,13 +137,36 @@ impl Browser {
             }
         });
 
-        Ok((Browser { _cdp: cdp, page, frame_tx, alive_rx }, rx))
+        // Bump a counter on each page load so the app can re-sync the viewport
+        // and screencast after a navigation (a new page is captured at a
+        // transitional size otherwise, breaking the fit).
+        let (nav_tx, nav_rx) = tokio::sync::watch::channel(0u64);
+        let nav_page = page.clone();
+        tokio::spawn(async move {
+            if let Ok(mut ev) = nav_page.event_listener::<EventLoadEventFired>().await {
+                let mut n = 0u64;
+                while ev.next().await.is_some() {
+                    n += 1;
+                    if nav_tx.send(n).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok((Browser { _cdp: cdp, page, frame_tx, alive_rx, nav_rx }, rx))
     }
 
     /// Returns a watch receiver that starts as `true` and flips to `false`
     /// when the CDP handler task ends (Chrome disconnected or crashed).
     pub fn alive(&self) -> tokio::sync::watch::Receiver<bool> {
         self.alive_rx.clone()
+    }
+
+    /// Returns a watch receiver whose value increments each time the page fires
+    /// a load event (i.e. a navigation completed).
+    pub fn navigated(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.nav_rx.clone()
     }
 
     pub async fn navigate(&self, url: &str) -> Result<()> {
@@ -205,18 +231,46 @@ impl Browser {
         Ok(())
     }
 
+    /// Move the mouse pointer to (x, y) without pressing — drives `:hover`
+    /// states and keeps Chrome's hit-test position current.
+    pub async fn move_mouse(&self, x: f64, y: f64) -> Result<()> {
+        let params = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseMoved)
+            .x(x)
+            .y(y)
+            .build()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        self.page.execute(params).await.map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
     pub async fn click(&self, x: f64, y: f64, button: MouseButton) -> Result<()> {
         let b = match button {
             MouseButton::Left => CdpMouseButton::Left,
             MouseButton::Middle => CdpMouseButton::Middle,
             MouseButton::Right => CdpMouseButton::Right,
         };
-        for ty in [DispatchMouseEventType::MousePressed, DispatchMouseEventType::MouseReleased] {
+        // `buttons` is the bitmask of buttons currently held: 1=left, 2=right,
+        // 4=middle. Chrome requires it to register a real click — pressed sets
+        // the bit, released clears it. (Omitting it makes clicks unreliable.)
+        let mask: i64 = match button {
+            MouseButton::Left => 1,
+            MouseButton::Right => 2,
+            MouseButton::Middle => 4,
+        };
+        // Move to the point first so hover-activated targets and hit-testing
+        // resolve to the element under the cursor before pressing.
+        self.move_mouse(x, y).await?;
+        for (ty, buttons) in [
+            (DispatchMouseEventType::MousePressed, mask),
+            (DispatchMouseEventType::MouseReleased, 0),
+        ] {
             let params = DispatchMouseEventParams::builder()
                 .r#type(ty)
                 .x(x)
                 .y(y)
                 .button(b.clone())
+                .buttons(buttons)
                 .click_count(1i64)
                 .build()
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;

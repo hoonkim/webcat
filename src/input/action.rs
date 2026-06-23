@@ -8,6 +8,7 @@ pub enum Action {
     InsertText(String),
     Key(Key, Mods),
     ClickPixel { x: f64, y: f64, button: MouseButton },
+    MoveMouse { x: f64, y: f64 },
     ScrollPixel { x: f64, y: f64, dy: f64 },
     EnterUrlMode,
     EnterInsertMode,

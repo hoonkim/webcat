@@ -85,7 +85,8 @@ impl InputMapper {
             MouseKind::Down(b) => Action::ClickPixel { x, y, button: b },
             MouseKind::WheelDown => Action::ScrollPixel { x, y, dy: line },
             MouseKind::WheelUp => Action::ScrollPixel { x, y, dy: -line },
-            _ => Action::None,
+            MouseKind::Move => Action::MoveMouse { x, y },
+            MouseKind::Up(_) => Action::None,
         }
     }
 }
