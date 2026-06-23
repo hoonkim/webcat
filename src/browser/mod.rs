@@ -16,7 +16,7 @@ use chromiumoxide::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, MouseButton as CdpMouseButton,
     InsertTextParams,
 };
-use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+use chromiumoxide::cdp::browser_protocol::emulation::{SetDeviceMetricsOverrideParams, SetUserAgentOverrideParams};
 use base64::Engine;
 
 use crate::config::Config;
@@ -70,6 +70,11 @@ impl Browser {
             .new_headless_mode()
             .window_size(window.0, window.1)
             .arg("--remote-allow-origins=*")
+            // Hide the automation signal (navigator.webdriver). Combined with the
+            // de-headlessed user agent set below, this lets sites like YouTube
+            // that refuse automated/headless clients keep serving media beyond
+            // the initial buffer.
+            .arg("--disable-blink-features=AutomationControlled")
             .build()
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
 
@@ -97,6 +102,19 @@ impl Browser {
                 .await
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?,
         );
+
+        // De-headless the user agent: the default headless UA contains
+        // "HeadlessChrome", which YouTube (and others) detect and use to cut off
+        // media playback after the initial buffer. Take the real UA and drop the
+        // "Headless" marker so it matches the installed Chrome version exactly.
+        if let Ok(eval) = page.evaluate("navigator.userAgent").await {
+            if let Ok(ua) = eval.into_value::<String>() {
+                let real_ua = ua.replace("HeadlessChrome", "Chrome");
+                let _ = page
+                    .execute(SetUserAgentOverrideParams::new(real_ua))
+                    .await;
+            }
+        }
 
         let (tx, rx) = frame_channel();
         let frame_tx = Arc::new(tx);
