@@ -1,7 +1,3 @@
-use base64::Engine;
-
-const CHUNK: usize = 4096;
-
 pub struct KittyGraphics {
     image_id: u32,
     placement_id: u32,
@@ -12,40 +8,21 @@ impl KittyGraphics {
         KittyGraphics { image_id, placement_id: 1 }
     }
 
-    /// Transmit a JPEG and place it at the cursor, replacing any prior placement
-    /// with the same (image_id, placement_id). Chunked at CHUNK base64 bytes.
-    pub fn transmit_and_place_jpeg(&self, jpeg: &[u8]) -> Vec<u8> {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
-        let bytes = b64.as_bytes();
-        let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 256);
-
-        // Split into ≤CHUNK pieces; if it fits in one, that single piece is the last.
-        let chunks: Vec<&[u8]> = if bytes.is_empty() {
-            vec![&[][..]]
-        } else {
-            bytes.chunks(CHUNK).collect()
-        };
-        let last = chunks.len() - 1;
-
-        for (idx, chunk) in chunks.iter().enumerate() {
-            out.extend_from_slice(b"\x1b_G");
-            if idx == 0 {
-                // First chunk carries all control keys.
-                let m = if last == 0 { 0 } else { 1 };
-                let header = format!(
-                    "f=100,a=T,i={},p={},q=2,m={}",
-                    self.image_id, self.placement_id, m
-                );
-                out.extend_from_slice(header.as_bytes());
-            } else {
-                let m = if idx == last { 0 } else { 1 };
-                out.extend_from_slice(format!("m={}", m).as_bytes());
-            }
-            out.push(b';');
-            out.extend_from_slice(chunk);
-            out.extend_from_slice(b"\x1b\\");
-        }
-        out
+    /// Build the kitty escape that transmits a `width`×`height` RGBA image from a
+    /// POSIX shared-memory object (`f=32,t=s`) and displays it at the cursor at
+    /// native pixel size, replacing any prior placement with the same
+    /// (image_id, placement_id).
+    ///
+    /// `name_b64` is the base64-encoded shm object name (the only payload — the
+    /// pixels travel through shared memory, not the terminal pipe). Native
+    /// placement (no c/r scaling) reproduces the frame 1:1; the caller renders
+    /// the frame at the terminal's device resolution so it fills the screen.
+    pub fn transmit_shm(&self, name_b64: &str, width: u32, height: u32) -> Vec<u8> {
+        format!(
+            "\x1b_Gf=32,t=s,s={},v={},a=T,i={},p={},q=2;{}\x1b\\",
+            width, height, self.image_id, self.placement_id, name_b64
+        )
+        .into_bytes()
     }
 
     /// Delete the transmitted image (and its placements) by id.
@@ -65,34 +42,21 @@ mod tests {
     }
 
     #[test]
-    fn small_jpeg_is_single_chunk() {
+    fn transmit_shm_emits_rgba_shared_memory_escape() {
         let g = KittyGraphics::new(7);
-        let out = payload_of(&g.transmit_and_place_jpeg(&[0xFF, 0xD8, 0xFF, 0xD9]));
-        // Begins with the graphics APC opener and the expected control keys.
+        let out = payload_of(&g.transmit_shm("YmFzZTY0", 1144, 880));
         assert!(out.starts_with("\x1b_G"), "missing APC opener: {out:?}");
-        assert!(out.contains("f=100"), "missing f=100");
-        assert!(out.contains("a=T"), "missing a=T");
+        assert!(out.contains("f=32"), "missing RGBA format");
+        assert!(out.contains("t=s"), "missing shared-memory transmission");
+        assert!(out.contains("s=1144"), "missing pixel width");
+        assert!(out.contains("v=880"), "missing pixel height");
+        assert!(out.contains("a=T"), "missing transmit+display action");
         assert!(out.contains("i=7"), "missing image id");
         assert!(out.contains("q=2"), "missing quiet flag");
-        assert!(out.contains("m=0"), "single chunk must end with m=0");
-        assert!(out.ends_with("\x1b\\"), "missing ST terminator");
-        // Exactly one APC block for a small image.
+        // Payload is the base64 shm name after ';', then ST.
+        assert!(out.ends_with(";YmFzZTY0\x1b\\"), "payload must be the shm name: {out:?}");
+        // A single, compact escape — no pixel data in the pipe.
         assert_eq!(out.matches("\x1b_G").count(), 1);
-    }
-
-    #[test]
-    fn large_jpeg_is_chunked_with_m_flags() {
-        let g = KittyGraphics::new(1);
-        // 10_000 raw bytes -> base64 ~13_336 chars -> 4 chunks of 4096 max.
-        let big = vec![0xABu8; 10_000];
-        let out = payload_of(&g.transmit_and_place_jpeg(&big));
-        let blocks = out.matches("\x1b_G").count();
-        assert_eq!(blocks, 4, "expected exactly 4 chunks for 10000 bytes");
-        // Control keys only on first block.
-        assert_eq!(out.matches("f=100").count(), 1);
-        // Every block except the last carries m=1; last carries m=0.
-        assert_eq!(out.matches("m=1").count(), blocks - 1);
-        assert_eq!(out.matches("m=0").count(), 1);
     }
 
     #[test]

@@ -52,13 +52,20 @@ pub struct Browser {
 // standalone and only calls a subset, so the rest appear dead there.
 #[allow(dead_code)]
 impl Browser {
-    pub async fn launch(cfg: &Config, chrome: PathBuf) -> Result<(Browser, FrameRx)> {
+    pub async fn launch(cfg: &Config, chrome: PathBuf, window: (u32, u32)) -> Result<(Browser, FrameRx)> {
         profile::prepare_profile(&cfg.profile_dir)?;
 
+        // The screencast captures the compositor WINDOW surface, not the
+        // device-metrics viewport. The window must therefore be at least as
+        // large as the page viewport (otherwise the page is cropped to the
+        // window). We size it generously; the actual layout is still controlled
+        // by set_viewport (setDeviceMetricsOverride), and the renderer scales
+        // the captured frame to fill the terminal.
         let bc = BrowserConfig::builder()
             .chrome_executable(chrome)
             .user_data_dir(cfg.profile_dir.clone())
             .new_headless_mode()
+            .window_size(window.0, window.1)
             .arg("--remote-allow-origins=*")
             .build()
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
@@ -160,6 +167,9 @@ impl Browser {
     pub async fn start_screencast(&self, quality: u8, vp: Viewport) -> Result<()> {
         // Note: StartScreencastParams::builder().build() returns StartScreencastParams
         // directly (not Result) in chromiumoxide 0.7.0 — all fields are optional.
+        // JPEG is far smaller/faster to encode than PNG. kitty can't display JPEG
+        // directly, so the renderer decodes each frame to RGBA and hands the
+        // pixels to kitty via shared memory (f=32,t=s) — no PNG, no pixel base64.
         let params = StartScreencastParams::builder()
             .format(StartScreencastFormat::Jpeg)
             .quality(quality as i64)

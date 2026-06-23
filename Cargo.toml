@@ -25,3 +25,9 @@ serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+# Optimize dependencies (notably the JPEG decoder) even in debug builds so
+# screencast frames decode fast enough for smooth rendering, while keeping the
+# webcat crate itself unoptimized for fast, debuggable builds.
+[profile.dev.package."*"]
+opt-level = 3

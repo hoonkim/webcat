@@ -24,10 +24,23 @@ impl Config {
             chrome: cli.chrome,
             log_path,
             quality: cli.quality.clamp(1, 100),
-            dpr: if cli.dpr > 0.0 { cli.dpr } else { 1.0 },
+            dpr: match cli.dpr {
+                Some(d) if d > 0.0 => d,
+                _ => default_dpr(),
+            },
             start_url: cli.url.unwrap_or_else(|| "about:blank".to_string()),
         })
     }
+}
+
+/// Default render scale. kitty maps a graphics image's pixels 1:1 onto the
+/// logical terminal cell grid, so a frame sized to the page viewport
+/// (cols×rows of cells) fills the window exactly. dpr>1 renders the page at a
+/// larger device resolution (sharper on HiDPI) but the placed image then
+/// overflows unless the terminal scales it down, so 1.0 is the safe default;
+/// override with --dpr to experiment.
+fn default_dpr() -> f64 {
+    1.0
 }
 
 fn default_profile_dir() -> PathBuf {
@@ -51,7 +64,7 @@ mod tests {
     use crate::cli::Cli;
 
     fn base_cli() -> Cli {
-        Cli { url: None, profile_dir: None, chrome: None, quality: 70, dpr: 1.0 }
+        Cli { url: None, profile_dir: None, chrome: None, quality: 70, dpr: Some(1.0) }
     }
 
     #[test]

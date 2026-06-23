@@ -29,7 +29,7 @@ async fn navigate_and_screencast_and_korean_input() {
         start_url: "about:blank".into(),
     };
 
-    let (b, mut frames) = browser::Browser::launch(&cfg, chrome).await.expect("launch");
+    let (b, mut frames) = browser::Browser::launch(&cfg, chrome, (1024, 856)).await.expect("launch");
     let vp = geometry::Viewport { width_px: 800, height_px: 600 };
     b.set_viewport(vp, 1.0).await.unwrap();
 
