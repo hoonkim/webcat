@@ -103,14 +103,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                     }
                 }
                 // Use cached current_url — no per-frame round-trip to Chrome.
-                let status = match mapper.mode {
-                    Mode::Insert => format!("-- INSERT --  {current_url}"),
-                    _ => current_url.clone(),
-                };
-                out.write_all(&ui.status_bar(&status, false))?;
-                if mapper.mode == Mode::UrlInput {
-                    out.write_all(&ui.url_prompt(&url_buffer))?;
-                }
+                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer)?;
                 out.flush()?;
             }
 
@@ -276,12 +269,36 @@ pub async fn run(cfg: Config) -> Result<()> {
                 if let Some((x, y)) = pending_move {
                     let _ = browser.move_mouse(x, y).await;
                 }
+                // Redraw the status line immediately after input so URL editing
+                // and mode changes update even on static pages (no frame ticks).
+                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer)?;
+                out.flush()?;
                 if quit { break; }
             }
         }
     }
 
     guard.restore();
+    Ok(())
+}
+
+/// Draw the bottom status line (and the URL prompt when in URL-input mode).
+/// Each piece clears its line first, so shrinking text leaves no leftovers.
+fn write_status(
+    out: &mut impl std::io::Write,
+    ui: &Ui,
+    mode: Mode,
+    current_url: &str,
+    url_buffer: &str,
+) -> std::io::Result<()> {
+    let status = match mode {
+        Mode::Insert => format!("-- INSERT --  {current_url}"),
+        _ => current_url.to_string(),
+    };
+    out.write_all(&ui.status_bar(&status, false))?;
+    if mode == Mode::UrlInput {
+        out.write_all(&ui.url_prompt(url_buffer))?;
+    }
     Ok(())
 }
 

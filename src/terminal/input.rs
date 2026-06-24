@@ -21,6 +21,18 @@ pub fn classify(seq: &str) -> Option<RawInput> {
     }
     // Plain text (the OS IME already composed Korean into final UTF-8).
     if !seq.is_empty() && !seq.starts_with('\x1b') {
+        // kitty's disambiguate mode still sends Enter/Backspace/Tab as their
+        // legacy control bytes (not CSI-u), so map those to the special keys;
+        // otherwise they'd be treated as typed characters.
+        let key = match seq {
+            "\r" | "\n" => Some(Key::Enter),
+            "\x7f" | "\x08" => Some(Key::Backspace),
+            "\t" => Some(Key::Tab),
+            _ => None,
+        };
+        if let Some(key) = key {
+            return Some(RawInput::Key(KeyEvent { key, mods: Mods::none(), text: None }));
+        }
         let first = seq.chars().next()?;
         return Some(RawInput::Key(KeyEvent {
             key: Key::Char(first),
@@ -162,6 +174,14 @@ mod tests {
     #[test]
     fn classifies_sgr_mouse() {
         assert!(matches!(classify("\x1b[<0;5;9M"), Some(RawInput::Mouse(_))));
+    }
+
+    #[test]
+    fn classifies_legacy_control_keys() {
+        use crate::terminal::keyboard::Key;
+        assert!(matches!(classify("\r"), Some(RawInput::Key(KeyEvent { key: Key::Enter, .. }))));
+        assert!(matches!(classify("\x7f"), Some(RawInput::Key(KeyEvent { key: Key::Backspace, .. }))));
+        assert!(matches!(classify("\t"), Some(RawInput::Key(KeyEvent { key: Key::Tab, .. }))));
     }
 
     #[test]
