@@ -1,6 +1,11 @@
 use base64::Engine;
 use std::ffi::CString;
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Process-global counter so every Shm gets a unique name (no collisions
+/// between pool buffers or, in tests, concurrently-running Shm instances).
+static SHM_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// A POSIX shared-memory object used to hand raw RGBA pixels to kitty via the
 /// graphics protocol's `t=s` (shared memory) transmission. The escape carries
@@ -17,10 +22,12 @@ pub struct Shm {
 }
 
 impl Shm {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Shm {
         // POSIX shm names must start with '/' and stay short (macOS PSHMNAMLEN
-        // is 31). "/webcat_<pid>" fits comfortably.
-        let name = format!("/webcat_{}", std::process::id());
+        // is 31). "/webcat_<pid>_<seq>" fits comfortably and is unique.
+        let seq = SHM_SEQ.fetch_add(1, Ordering::Relaxed);
+        let name = format!("/webcat_{}_{}", std::process::id(), seq);
         let name_b64 = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
         Shm { name, name_b64 }
     }

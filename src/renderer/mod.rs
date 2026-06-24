@@ -4,10 +4,16 @@ pub mod shm;
 use crate::geometry::{GridSize, CellSize};
 
 const IMAGE_ID: u32 = 1;
+/// Number of shared-memory buffers to rotate through. Using a fresh buffer each
+/// frame means the object kitty is still reading (from the previous frame) is
+/// never the one we're overwriting — which otherwise causes an occasional black
+/// flash when kitty reads a half-written/just-unlinked object.
+const SHM_POOL: usize = 4;
 
 pub struct Renderer {
     gfx: graphics::KittyGraphics,
-    shm: shm::Shm,
+    shms: Vec<shm::Shm>,
+    shm_idx: usize,
     #[allow(dead_code)]
     grid: GridSize,
     #[allow(dead_code)]
@@ -18,7 +24,8 @@ impl Renderer {
     pub fn new(grid: GridSize, cell: CellSize) -> Renderer {
         Renderer {
             gfx: graphics::KittyGraphics::new(IMAGE_ID),
-            shm: shm::Shm::new(),
+            shms: (0..SHM_POOL).map(|_| shm::Shm::new()).collect(),
+            shm_idx: 0,
             grid,
             cell,
         }
@@ -29,12 +36,12 @@ impl Renderer {
         self.cell = cell;
     }
 
-    /// Decode a JPEG screencast frame to RGBA, write the pixels to shared memory,
-    /// and return the bytes to position the cursor and display the frame from
-    /// shared memory (kitty `f=32,t=s`). Returns an empty Vec if the frame can't
-    /// be decoded or written (the caller simply skips it — the previous frame
-    /// stays on screen).
-    pub fn present_jpeg_bytes(&self, jpeg: &[u8]) -> Vec<u8> {
+    /// Decode a JPEG screencast frame to RGBA, write the pixels to the next
+    /// shared-memory buffer in the pool, and return the bytes to position the
+    /// cursor and display the frame from shared memory (kitty `f=32,t=s`).
+    /// Returns an empty Vec if the frame can't be decoded or written (the caller
+    /// simply skips it — the previous frame stays on screen).
+    pub fn present_jpeg_bytes(&mut self, jpeg: &[u8]) -> Vec<u8> {
         let img = match image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg) {
             Ok(img) => img.into_rgba8(),
             Err(e) => {
@@ -44,13 +51,15 @@ impl Renderer {
         };
         let (w, h) = img.dimensions();
         let rgba = img.into_raw();
-        if let Err(e) = self.shm.write(&rgba) {
+        let shm = &self.shms[self.shm_idx];
+        self.shm_idx = (self.shm_idx + 1) % self.shms.len();
+        if let Err(e) = shm.write(&rgba) {
             tracing::warn!("shm write failed: {e}");
             return Vec::new();
         }
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(b"\x1b[1;1H"); // cursor to row 1, col 1
-        out.extend_from_slice(&self.gfx.transmit_shm(self.shm.name_base64(), w, h));
+        out.extend_from_slice(&self.gfx.transmit_shm(shm.name_base64(), w, h));
         out
     }
 
@@ -76,7 +85,7 @@ mod tests {
 
     #[test]
     fn present_positions_cursor_then_transmits_from_shm() {
-        let r = Renderer::new(GridSize { cols: 80, rows: 24 }, CellSize { w: 8, h: 16 });
+        let mut r = Renderer::new(GridSize { cols: 80, rows: 24 }, CellSize { w: 8, h: 16 });
         let out = String::from_utf8(r.present_jpeg_bytes(&tiny_jpeg())).unwrap();
         // Cursor home (row1,col1) before the graphics block.
         let home_idx = out.find("\x1b[1;1H").expect("cursor home missing");
@@ -88,7 +97,7 @@ mod tests {
 
     #[test]
     fn present_skips_invalid_jpeg() {
-        let r = Renderer::new(GridSize { cols: 80, rows: 24 }, CellSize { w: 8, h: 16 });
+        let mut r = Renderer::new(GridSize { cols: 80, rows: 24 }, CellSize { w: 8, h: 16 });
         // Not a JPEG: decode fails, frame skipped (empty output, no panic).
         let out = r.present_jpeg_bytes(&[0x00, 0x01, 0x02, 0x03]);
         assert!(out.is_empty());
