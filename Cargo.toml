@@ -9,7 +9,7 @@ tokio = { version = "1", features = ["full"] }
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
 futures = "0.3"
 crossterm = { version = "0.28", features = ["event-stream"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "1"

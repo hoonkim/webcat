@@ -25,13 +25,13 @@ async fn navigate_and_screencast_and_korean_input() {
         chrome: Some(chrome.clone()),
         log_path: tmp.join("log"),
         quality: 70,
-        dpr: 1.0,
+        zoom: 1.0,
         start_url: "about:blank".into(),
     };
 
     let (b, mut frames) = browser::Browser::launch(&cfg, chrome, (1024, 856)).await.expect("launch");
     let vp = geometry::Viewport { width_px: 800, height_px: 600 };
-    b.set_viewport(vp, 1.0).await.unwrap();
+    b.set_viewport(vp).await.unwrap();
 
     // Page with a text input we can focus and type Korean into.
     let html = "data:text/html,<input id=t autofocus>";

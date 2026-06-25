@@ -7,8 +7,9 @@ use futures::StreamExt;
 
 use chromiumoxide::{Browser as CdpBrowser, BrowserConfig, Page};
 use chromiumoxide::cdp::browser_protocol::page::{
-    StartScreencastParams, StartScreencastFormat, ScreencastFrameAckParams, EventScreencastFrame,
-    NavigateParams,
+    StartScreencastParams, StartScreencastFormat,
+    ScreencastFrameAckParams, EventScreencastFrame,
+    NavigateParams, AddScriptToEvaluateOnNewDocumentParams,
     EventJavascriptDialogOpening, HandleJavaScriptDialogParams, EventLoadEventFired,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
@@ -49,6 +50,10 @@ pub struct Browser {
     /// Increments on each page load so the app can re-sync after navigation.
     #[allow(dead_code)]
     nav_rx: tokio::sync::watch::Receiver<u64>,
+    /// Page zoom factor. The frame/grid work in device pixels; Chrome lays the
+    /// page out and reports coordinates in CSS pixels (device ÷ zoom), so input
+    /// coordinates are divided by zoom and clickable rects multiplied by it.
+    zoom: f64,
 }
 
 // Methods are called from app.rs; the integration test includes this file
@@ -56,7 +61,10 @@ pub struct Browser {
 #[allow(dead_code)]
 impl Browser {
     pub async fn launch(cfg: &Config, chrome: PathBuf, window: (u32, u32)) -> Result<(Browser, FrameRx)> {
-        profile::prepare_profile(&cfg.profile_dir)?;
+        // Use the default profile if free, else a private temp profile, so
+        // multiple webcat windows don't deadlock on Chrome's per-profile lock.
+        let profile_dir = profile::resolve_profile(&cfg.profile_dir);
+        profile::prepare_profile(&profile_dir)?;
 
         // The screencast captures the compositor WINDOW surface, not the
         // device-metrics viewport. The window must therefore be at least as
@@ -66,7 +74,7 @@ impl Browser {
         // the captured frame to fill the terminal.
         let bc = BrowserConfig::builder()
             .chrome_executable(chrome)
-            .user_data_dir(cfg.profile_dir.clone())
+            .user_data_dir(profile_dir)
             .new_headless_mode()
             .window_size(window.0, window.1)
             .arg("--remote-allow-origins=*")
@@ -115,6 +123,42 @@ impl Browser {
                     .await;
             }
         }
+
+        // Injected on every document (every navigation). Two purposes:
+        // 1. Keep navigation in this single captured tab — a new tab (target=
+        //    _blank / window.open) becomes a target we don't screencast and our
+        //    page is backgrounded, freezing the terminal.
+        // 2. Neutralise native browser UI that headless Chrome can't display and
+        //    that otherwise blocks the renderer forever (the terminal freezes):
+        //    WebAuthn/passkey prompts (navigator.credentials) and permission
+        //    requests. These reject/deny immediately so the page falls back
+        //    (e.g. to a password form) instead of hanging.
+        let page_shim_js = r#"
+            (function(){
+              try {
+                window.open = function(u){ if (u) { try { window.location.href = u; } catch(e){} } return window; };
+              } catch(e){}
+              document.addEventListener('click', function(e){
+                try {
+                  var a = e.target && e.target.closest ? e.target.closest('a[target]') : null;
+                  if (a && a.target && a.target !== '_self') { a.target = '_self'; }
+                } catch(err){}
+              }, true);
+              try {
+                if (navigator.credentials) {
+                  var reject = function(){ return Promise.reject(new DOMException('not supported in webcat', 'NotAllowedError')); };
+                  navigator.credentials.get = reject;
+                  navigator.credentials.create = reject;
+                }
+              } catch(e){}
+              try {
+                if (window.Notification) { Notification.requestPermission = function(){ return Promise.resolve('denied'); }; }
+              } catch(e){}
+            })();
+        "#;
+        let _ = page
+            .execute(AddScriptToEvaluateOnNewDocumentParams::new(page_shim_js.to_string()))
+            .await;
 
         let (tx, rx) = frame_channel();
         let frame_tx = Arc::new(tx);
@@ -172,7 +216,7 @@ impl Browser {
             }
         });
 
-        Ok((Browser { _cdp: cdp, page, frame_tx, alive_rx, nav_rx }, rx))
+        Ok((Browser { _cdp: cdp, page, frame_tx, alive_rx, nav_rx, zoom: cfg.zoom }, rx))
     }
 
     /// Returns a watch receiver that starts as `true` and flips to `false`
@@ -198,22 +242,26 @@ impl Browser {
     pub async fn go_back(&self) { let _ = self.page.evaluate("history.back()").await; }
     pub async fn reload(&self) { let _ = self.page.reload().await; }
 
-    pub async fn set_viewport(&self, vp: Viewport, dpr: f64) -> Result<()> {
+    /// Set the page metrics for a `dev` capture viewport in DEVICE pixels (what
+    /// fills the terminal grid). The CSS layout viewport is `dev / zoom` and the
+    /// device scale factor is `zoom`, so the captured frame stays `dev` pixels
+    /// while the page lays out (and renders text) at `zoom`× magnification.
+    pub async fn set_viewport(&self, dev: Viewport) -> Result<()> {
+        // CSS layout viewport = device grid / zoom (natural text size); device
+        // scale factor = zoom. The renderer scales the captured frame to the
+        // cell grid, which fills the screen.
+        let css_w = (dev.width_px as f64 / self.zoom).round().max(1.0) as i64;
+        let css_h = (dev.height_px as f64 / self.zoom).round().max(1.0) as i64;
         self.page
-            .execute(SetDeviceMetricsOverrideParams::new(
-                vp.width_px as i64, vp.height_px as i64, dpr, false,
-            ))
+            .execute(SetDeviceMetricsOverrideParams::new(css_w, css_h, self.zoom, false))
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
         Ok(())
     }
 
     pub async fn start_screencast(&self, quality: u8, vp: Viewport) -> Result<()> {
-        // Note: StartScreencastParams::builder().build() returns StartScreencastParams
-        // directly (not Result) in chromiumoxide 0.7.0 — all fields are optional.
-        // JPEG is far smaller/faster to encode than PNG. kitty can't display JPEG
-        // directly, so the renderer decodes each frame to RGBA and hands the
-        // pixels to kitty via shared memory (f=32,t=s) — no PNG, no pixel base64.
+        // The renderer up-scales the captured (logical-resolution) frame to fill
+        // the cell grid. JPEG keeps the stream light and fast.
         let params = StartScreencastParams::builder()
             .format(StartScreencastFormat::Jpeg)
             .quality(quality as i64)
@@ -226,6 +274,7 @@ impl Browser {
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
         Ok(())
     }
+
 
     pub async fn insert_text(&self, text: &str) -> Result<()> {
         self.page
@@ -252,6 +301,7 @@ impl Browser {
     /// Move the mouse pointer to (x, y) without pressing — drives `:hover`
     /// states and keeps Chrome's hit-test position current.
     pub async fn move_mouse(&self, x: f64, y: f64) -> Result<()> {
+        let (x, y) = (x / self.zoom, y / self.zoom);
         let params = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MouseMoved)
             .x(x)
@@ -277,8 +327,10 @@ impl Browser {
             MouseButton::Middle => 4,
         };
         // Move to the point first so hover-activated targets and hit-testing
-        // resolve to the element under the cursor before pressing.
+        // resolve to the element under the cursor before pressing. move_mouse
+        // applies the device→CSS conversion; do the same for press/release here.
         self.move_mouse(x, y).await?;
+        let (x, y) = (x / self.zoom, y / self.zoom);
         for (ty, buttons) in [
             (DispatchMouseEventType::MousePressed, mask),
             (DispatchMouseEventType::MouseReleased, 0),
@@ -298,6 +350,8 @@ impl Browser {
     }
 
     pub async fn scroll(&self, x: f64, y: f64, dy: f64) -> Result<()> {
+        // Device → CSS pixels (position and scroll delta both scale by zoom).
+        let (x, y, dy) = (x / self.zoom, y / self.zoom, dy / self.zoom);
         let params = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MouseWheel)
             .x(x)
@@ -336,7 +390,10 @@ impl Browser {
         "#;
         let json = self.eval_string(js).await?;
         let parsed: Vec<(f64, f64)> = serde_json::from_str(&json).unwrap_or_default();
-        Ok(parsed.into_iter().map(|(x, y)| Clickable { x, y }).collect())
+        // getBoundingClientRect is in CSS pixels; convert to device pixels (the
+        // space the frame and terminal grid use) so hint labels land correctly.
+        let z = self.zoom;
+        Ok(parsed.into_iter().map(|(x, y)| Clickable { x: x * z, y: y * z }).collect())
     }
 }
 

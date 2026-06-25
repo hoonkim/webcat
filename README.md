@@ -2,15 +2,15 @@
 
 A modal terminal web browser. It drives a headless Chromium instance over the Chrome DevTools Protocol (CDP), receives the page as a JPEG screencast, and displays it in the terminal using the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). Korean and other IME-composed text is fully supported via `Input.insertText`.
 
-**How frames are displayed:** each JPEG frame is decoded to RGBA and the raw pixels are handed to Kitty through a POSIX **shared-memory** object (`f=32,t=s`) — only the tiny shm name travels through the terminal, never the pixels — so rendering stays smooth even at high resolution. The frame is sized to the page viewport (terminal cols×rows of cells) and placed 1:1, so it fills the window. (`--dpr` can render the page at a higher device resolution; the default of `1.0` matches Kitty's 1:1 pixel-to-cell mapping.)
+**How frames are displayed:** each screencast frame is decoded to RGBA and the raw pixels are handed to Kitty through a POSIX **shared-memory** object (`f=32,t=s`) — only the tiny shm name travels through the terminal, never the pixels — so rendering stays smooth even at high resolution. The image is drawn at `z=-1` (below the text layer) and scaled to the cell grid so it fills the window, with the status bar and hint labels rendered as terminal text on top.
 
 ---
 
 ## Requirements
 
-- **Kitty terminal** — the Kitty graphics protocol is required; other terminals are not supported (webcat will print an error and exit if the protocol is not detected).
+- **Kitty terminal** — the Kitty graphics protocol is required; other terminals are not supported (webcat prints an error and exits if the protocol is not detected).
 - **Google Chrome or Chromium** — a recent version must be installed. webcat launches it in headless mode.
-- **Rust toolchain** — to build from source (stable, 2021 edition).
+- **Rust toolchain** — to build from source (stable, 2021 edition). macOS or Linux.
 
 ---
 
@@ -30,25 +30,31 @@ The binary is written to `target/release/webcat`. Copy it anywhere on your `$PAT
 webcat [OPTIONS] [URL]
 ```
 
-Opens `URL` in the terminal browser. If no URL is given, opens `about:blank`.
+Opens `URL` in the terminal browser. If no URL is given, opens `about:blank`. The
+URL argument is normalised the same way as the `:` URL bar:
+
+```bash
+webcat google.com          # → https://google.com
+webcat https://naver.com   # used as-is
+webcat "rust async book"   # → Google search
+```
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
-| `--profile-dir <PATH>` | Chrome user-data directory (default: `$XDG_DATA_HOME/webcat/profile`) |
-| `--chrome <PATH>` | Path to the Chrome/Chromium binary |
-| `--quality <1-100>` | JPEG screencast quality (default: 70) |
-| `--dpr <FLOAT>` | Render the page at this device-pixel ratio (default: 1.0; raise for sharper text on HiDPI, though the image may then overflow on some displays) |
+| `--zoom <FLOAT>` | Page zoom factor (clamped 0.5–4.0). Defaults to the display's scale factor (2.0 on Retina) so sites open at a natural size. **Lower it for sharper (but smaller) text, raise it for larger text.** |
+| `--quality <1-100>` | JPEG screencast quality (default: 92). Higher is sharper at the cost of larger frames. |
+| `--profile-dir <PATH>` | Chrome user-data directory (default: `$XDG_DATA_HOME/webcat/profile`). |
+| `--chrome <PATH>` | Path to the Chrome/Chromium binary. |
 
 ### Environment variables
 
 | Variable | Description |
 |----------|-------------|
-| `WEBCAT_CHROME` | Path to Chrome/Chromium binary (overridden by `--chrome`) |
-| `WEBCAT_PROFILE_DIR` | Chrome profile directory (overridden by `--profile-dir`) |
-| `WEBCAT_LOG` | Path for the log file (default: `$XDG_STATE_HOME/webcat/log`) |
-| `WEBCAT_LOG_LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `warn`) |
+| `WEBCAT_CHROME` | Path to Chrome/Chromium binary (overridden by `--chrome`). |
+| `WEBCAT_PROFILE_DIR` | Chrome profile directory (overridden by `--profile-dir`). |
+| `WEBCAT_LOG_LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`). |
 
 ---
 
@@ -56,41 +62,47 @@ Opens `URL` in the terminal browser. If no URL is given, opens `about:blank`.
 
 webcat is **modal**: Normal mode accepts commands; Insert mode forwards keystrokes to the focused page element.
 
+> **Tip:** commands (`i`, `:`, `f`, …) are English letters. If your OS input method is set to Korean, switch it back to English for Normal-mode commands (the IME composes `i` into `ㅣ`, etc.). Insert mode and the URL bar accept Korean directly.
+
 ### Normal mode
 
 | Key | Action |
 |-----|--------|
 | `i` | Enter Insert mode |
-| `:` | Open URL bar (type a URL or search query, press Enter) |
-| `f` | Enter hint mode — labels clickable elements with single letters |
-| `j` | Scroll down |
-| `k` | Scroll up |
+| `:` | Open the URL bar (type a URL or search query, press Enter) |
+| `f` | Enter hint mode — labels every clickable element |
+| `j` / `k` | Scroll down / up |
 | `H` | Go back (browser history) |
 | `r` | Reload the page |
 | `q` | Quit |
 | Mouse click | Click the element under the cursor |
 | Mouse scroll | Scroll the page |
+| Mouse move | Drives `:hover` states |
 
 ### Insert mode
 
 | Key | Action |
 |-----|--------|
 | `Esc` | Return to Normal mode |
-| Any printable key | Forward keystroke to the focused page element |
-| Arrow keys, Enter, Backspace, Tab, Delete | Forward to the focused element |
+| Any printable key | Forward keystroke to the focused page element (incl. Korean/IME text) |
+| Arrows, Enter, Backspace, Tab, Delete | Forward to the focused element |
 
 ### URL bar (`:` mode)
 
 Type a URL or search query and press `Enter`. webcat normalises input:
-- If it contains `://` or starts with `about:`, it is used as-is.
-- If it looks like a hostname (contains `.`, no spaces), `https://` is prepended.
-- Otherwise the input is sent to Google as a search query.
+- contains `://` or starts with `about:` → used as-is;
+- looks like a hostname (contains `.`, no spaces) → `https://` is prepended;
+- otherwise → sent to Google as a search query.
 
-Press `Esc` to cancel.
+`Backspace` edits, `Esc` cancels.
 
 ### Hint mode (`f`)
 
-Single-letter labels appear over every clickable element. Press the displayed letter to click that element. Press `Esc` to cancel.
+Labels appear over every clickable element. Type the label to click that element:
+- ≤ 26 elements → one-letter labels (`a`, `s`, `d`, …);
+- more → two-letter labels (`af`, `ad`, …) — type both letters; matching labels narrow as you type.
+
+`Esc` cancels.
 
 ---
 
@@ -101,37 +113,46 @@ Single-letter labels appear over every clickable element. Press the displayed le
 3. Type normally — the OS IME composes characters and delivers the committed Unicode text to webcat, which forwards it to Chromium via `Input.insertText`.
 4. Press `Esc` to leave Insert mode.
 
-> **Note:** In-field IME preedit composition (the grey underlined text shown while a syllable is being assembled) is not visible in webcat. The final committed text is delivered correctly.
+> **Note:** the IME preedit underline (grey text shown while a syllable is being assembled) is not visible in webcat; the final committed text is delivered correctly.
+
+---
+
+## Notes & behaviour
+
+- **Image quality vs. fill** — the screencast captures a logical-resolution frame that webcat up-scales to fill the terminal, so the image is slightly soft. For sharper text use a lower `--zoom` (e.g. `--zoom 1`) and/or a higher `--quality`. True device-resolution crispness is a limitation of CDP screencast (it sends full frames, not partial updates).
+- **Multiple windows** — Chrome allows one instance per profile. webcat detects this: the first window uses the persistent profile (your logins), and additional windows fall back to a private temporary profile so they still run. A stale lock from a crashed instance is cleared automatically.
+- **New tabs stay in-tab** — links that would open a new tab (`target=_blank` / `window.open`) are redirected to the current tab, since webcat captures a single page.
+- **Passkeys / native prompts** — WebAuthn/passkey requests and notification-permission prompts (which need native UI that headless Chrome can't show) are declined immediately so the page falls back (e.g. to a password form) instead of freezing.
+- **YouTube and video** — the user agent is de-headlessed so sites that refuse automated clients keep serving media.
+- **Backpressure** — frame transmission is paced to the terminal's actual draw rate, so a backgrounded/slow Kitty doesn't pile up memory.
 
 ---
 
 ## Logs
 
-Log output is written to `$XDG_STATE_HOME/webcat/log` (typically `~/.local/state/webcat/log` on Linux or `~/Library/Application Support/webcat/log` on macOS). Set `WEBCAT_LOG_LEVEL=debug` or `WEBCAT_LOG_LEVEL=trace` for verbose output.
+Log output goes to `$XDG_STATE_HOME/webcat/log` (typically `~/.local/state/webcat/log` on Linux or `~/Library/Application Support/webcat/log` on macOS). Set `WEBCAT_LOG_LEVEL=debug` for verbose output.
 
 ---
 
 ## Known limitations
 
-- **Single page, no tabs** — webcat manages one browser page. Tab support is planned for v2.
-- **Single-letter hints only** — the hint overlay assigns one letter per clickable element. If there are more than 26 clickable elements, only the first 26 are reachable via hints; the rest require mouse clicks.
-- **No in-field IME preedit** — the IME composition underline is not shown. Committed (final) text appears correctly.
-- **No in-page navigation controls** — there is no visible address bar or back/forward buttons; use `:` and `H` instead.
-- **Requires Kitty terminal** — the Kitty graphics protocol is not available in other terminals (xterm, iTerm2, GNOME Terminal, etc.).
+- **Single page, no tabs** — webcat manages one browser page.
+- **Soft image** — up-scaled screencast frames are slightly blurry; pixel-perfect rendering would require an embedded engine (CEF) with partial-frame updates.
+- **No in-field IME preedit** — the composition underline isn't shown; committed text appears correctly.
+- **Requires Kitty** — the graphics protocol isn't available in other terminals (xterm, iTerm2, GNOME Terminal, etc.).
 
 ---
 
 ## Manual acceptance checklist (run in Kitty)
 
-1. **Basic navigation** — `webcat https://example.com`, verify the page renders.
-2. **Scroll** — press `j`/`k` and use the mouse scroll wheel; page scrolls in both directions.
+1. **Navigation** — `webcat example.com`, verify the page renders and fills the window.
+2. **Scroll** — `j`/`k` and the mouse wheel scroll in both directions.
 3. **Click** — left-click a link; the page navigates.
-4. **Hint navigation** — press `f`; letter labels appear over links; press a letter; the target is clicked.
-5. **URL bar** — press `:`, type a hostname (e.g. `rust-lang.org`), press Enter; page navigates.
-6. **Search** — press `:`, type a plain phrase (e.g. `rust async book`), press Enter; Google search opens.
-7. **Insert mode / Korean** — click or tab to a text field, press `i`, switch OS IME to Korean, type `안녕하세요`; verify it appears in the field; press `Esc`.
-8. **Go back** — press `H`; browser history goes back.
-9. **Reload** — press `r`; page reloads.
-10. **Resize** — resize the Kitty window; the page reflows to the new size within a frame or two.
-11. **Quit with `q`** — press `q`; terminal is fully restored (cursor visible, alternate screen gone).
-12. **Quit with Ctrl-C** — relaunch, press Ctrl-C; terminal is fully restored.
+4. **Hints** — press `f`; labels appear; type a label (one or two letters); the target is clicked.
+5. **URL bar** — `:`, type `rust-lang.org`, Enter; page navigates.
+6. **Search** — `:`, type `rust async book`, Enter; Google search opens.
+7. **Korean** — focus a text field, `i`, switch OS IME to Korean, type `안녕하세요`; press `Esc`.
+8. **Back / Reload** — `H` goes back; `r` reloads.
+9. **Resize** — resize the Kitty window; the page refits and the status bar follows the new bottom row.
+10. **Zoom** — relaunch with `--zoom 1` (sharper/smaller) and `--zoom 2.5` (larger); text size changes.
+11. **Quit** — `q` and Ctrl-C both fully restore the terminal (cursor visible, alternate screen gone).

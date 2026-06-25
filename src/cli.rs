@@ -16,14 +16,15 @@ pub struct Cli {
     #[arg(long, env = "WEBCAT_CHROME")]
     pub chrome: Option<PathBuf>,
 
-    /// JPEG screencast quality 1-100.
-    #[arg(long, default_value_t = 70)]
+    /// JPEG screencast quality 1-100. Higher is sharper (less compression blur)
+    /// at the cost of bigger frames; 92 is a good default for crisp text.
+    #[arg(long, default_value_t = 92)]
     pub quality: u8,
 
-    /// Device pixel ratio (HiDPI scale). Frames are rendered at viewport×dpr
-    /// device pixels so they fill the terminal's HiDPI backing store and look
-    /// crisp. Defaults to 2.0 on macOS (Retina), 1.0 elsewhere; override per
-    /// display if the page doesn't fill (e.g. --dpr 1 on a non-HiDPI monitor).
+    /// Page zoom factor (clamped 0.5–4.0). Defaults to the display's scale factor
+    /// (2.0 on Retina) so sites open at their natural size — like a Chrome window
+    /// of the terminal's dimensions. Raise for bigger text, or pass --zoom 1 on a
+    /// non-HiDPI external monitor.
     #[arg(long)]
-    pub dpr: Option<f64>,
+    pub zoom: Option<f64>,
 }

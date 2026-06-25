@@ -9,12 +9,20 @@ pub enum RawInput {
     Key(KeyEvent),
     Mouse(crate::terminal::mouse::MouseEvent),
     Resize,
+    /// kitty graphics-protocol response (`ESC _G … ; OK/error ESC \`) — emitted
+    /// after the terminal processes a transmitted frame. Used for backpressure.
+    GfxAck,
 }
 
 /// Route one decoded sequence (a full escape or a plain UTF-8 grapheme/text) to a RawInput.
 pub fn classify(seq: &str) -> Option<RawInput> {
     if seq.starts_with("\x1b[<") {
         return parse_sgr_mouse(seq).map(RawInput::Mouse);
+    }
+    // kitty graphics response: ESC _G <key=val…> ; <OK|error> ESC \. Any such
+    // response means a transmitted frame was processed — used for backpressure.
+    if seq.starts_with("\x1b_G") {
+        return Some(RawInput::GfxAck);
     }
     if seq.starts_with("\x1b[") && seq.ends_with('u') {
         return parse_kitty_key(seq).map(RawInput::Key);
@@ -121,6 +129,30 @@ fn drain_tokens(buf: &mut Vec<u8>) -> Vec<String> {
                 } else {
                     break; // incomplete CSI — keep for next read
                 }
+            } else if matches!(buf[i + 1], b'_' | b'P' | b']' | b'^') {
+                // String escape (APC/DCS/OSC/PM) — e.g. kitty's graphics
+                // responses (ESC _G…). Terminated by ST (ESC \) or BEL. Emit the
+                // whole thing as one token so its body isn't parsed as keystrokes.
+                let mut j = i + 2;
+                let mut end = None;
+                while j < n {
+                    if buf[j] == 0x07 {
+                        end = Some(j); // BEL terminator
+                        break;
+                    }
+                    if buf[j] == 0x1b && j + 1 < n && buf[j + 1] == b'\\' {
+                        end = Some(j + 1); // ST terminator (ESC \)
+                        break;
+                    }
+                    j += 1;
+                }
+                match end {
+                    Some(e) => {
+                        out.push(String::from_utf8_lossy(&buf[i..=e]).into_owned());
+                        i = e + 1;
+                    }
+                    None => break, // incomplete string escape — keep for next read
+                }
             } else {
                 // Other ESC-prefixed escape: emit ESC + the following byte.
                 out.push(String::from_utf8_lossy(&buf[i..i + 2]).into_owned());
@@ -174,6 +206,31 @@ mod tests {
     #[test]
     fn classifies_sgr_mouse() {
         assert!(matches!(classify("\x1b[<0;5;9M"), Some(RawInput::Mouse(_))));
+    }
+
+    #[test]
+    fn classifies_kitty_graphics_ack() {
+        assert!(matches!(classify("\x1b_Gi=1;OK\x1b\\"), Some(RawInput::GfxAck)));
+    }
+
+    #[test]
+    fn drains_graphics_ack_as_one_token() {
+        // A graphics response interleaved with a keystroke must not have its
+        // body ("Gi=1;OK") parsed as individual key characters.
+        let mut buf: Vec<u8> = b"\x1b_Gi=1;OK\x1b\\a".to_vec();
+        let toks = drain_tokens(&mut buf);
+        assert_eq!(toks.len(), 2);
+        assert_eq!(toks[0], "\x1b_Gi=1;OK\x1b\\");
+        assert_eq!(toks[1], "a");
+    }
+
+    #[test]
+    fn keeps_incomplete_graphics_response_buffered() {
+        // No ST terminator yet — keep it for the next read, emit nothing.
+        let mut buf: Vec<u8> = b"\x1b_Gi=1;OK".to_vec();
+        let toks = drain_tokens(&mut buf);
+        assert!(toks.is_empty());
+        assert_eq!(buf, b"\x1b_Gi=1;OK");
     }
 
     #[test]

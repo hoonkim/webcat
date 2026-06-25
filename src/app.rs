@@ -26,32 +26,56 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size()?;
     let mut grid = GridSize { cols, rows };
     let cell = CellSize { w: cell_raw.w, h: cell_raw.h };
-    // `vp` is the page area in LOGICAL (CSS) pixels — the layout viewport.
-    // `dev` is that area in DEVICE pixels (vp × dpr) — the size the screencast
-    // captures and the renderer places 1:1, so it fills the terminal's HiDPI
-    // backing store (and renders crisply). This mirrors how awrit renders the
-    // browser at device resolution.
+    // `vp` is the page capture area in DEVICE pixels — the size the screencast
+    // captures and the renderer places 1:1, so it fills the terminal grid. The
+    // page's CSS layout size is derived from this and the zoom factor inside the
+    // browser layer (set_viewport), which also converts input coordinates.
     let mut vp = geometry::page_viewport(grid, cell, 1);
-    let mut dev = dev_viewport(vp, cfg.dpr);
 
     let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
-    let (mut browser, mut frames) = Browser::launch(&cfg, chrome, window_for(dev)).await?;
-    browser.set_viewport(vp, cfg.dpr).await?;
-    browser.navigate(&cfg.start_url).await?;
-    browser.start_screencast(cfg.quality, dev).await?;
+    let (mut browser, mut frames) = Browser::launch(&cfg, chrome, window_for(vp)).await?;
+    // Startup CDP calls are best-effort with a short timeout: Chrome 149 emits
+    // some CDP responses chromiumoxide 0.7.0 can't deserialize, so a request can
+    // occasionally never see its reply and hang. The command is still delivered
+    // (e.g. the navigation happens), so on timeout we log and continue rather
+    // than killing the app — the screencast loop renders the page regardless.
+    // Normalize the CLI start URL the same way the `:` URL bar does, so a
+    // scheme-less argument like `google.com` (or a search term) still opens.
+    let start_url = normalize_url(&cfg.start_url);
+    best_effort("set_viewport", browser.set_viewport(vp)).await;
+    best_effort("navigate", browser.navigate(&start_url)).await;
+    best_effort("start_screencast", browser.start_screencast(cfg.quality, vp)).await;
 
     let mut renderer = Renderer::new(grid, cell);
-    let ui = Ui::new(grid);
+    let mut ui = Ui::new(grid);
     let mut mapper = InputMapper::new(cell);
     let mut url_buffer = String::new();
 
     // Cached URL for status bar (avoids a per-frame round-trip to Chrome).
     // Also used as last_url for reconnection.
-    let mut current_url = cfg.start_url.clone();
+    let mut current_url = start_url.clone();
 
     let mut inputs = input_stream();
     let mut out = std::io::stdout();
     let mut hints: Vec<(String, crate::browser::Clickable)> = Vec::new();
+    // Hint labels currently painted on screen (label, col, row). The z=-1 frame
+    // no longer hides them, so we must erase these cells when leaving hint mode.
+    let mut drawn_hints: Vec<(String, u16, u16)> = Vec::new();
+    // Keystrokes typed so far toward selecting a (possibly multi-char) hint.
+    let mut hint_buffer = String::new();
+    // Backpressure: bound how many transmitted frames may be awaiting kitty's
+    // graphics ack. A backgrounded/slow kitty acks slowly, so we stop sending
+    // (and let frames coalesce) instead of piling up multi-MB shm buffers.
+    // SHM_POOL is 4, so keep in-flight below that to never overwrite a buffer
+    // kitty is still reading. Backpressure only engages once we've actually seen
+    // an ack, so terminals that don't respond keep rendering every frame.
+    const MAX_IN_FLIGHT: u32 = 2;
+    // If kitty stalls (no acks) for this long while we're blocked, force one
+    // frame through so a transient hiccup can't freeze the screen permanently.
+    let stall_timeout = Duration::from_millis(750);
+    let mut in_flight: u32 = 0;
+    let mut gfx_acked = false;
+    let mut last_transmit = std::time::Instant::now();
 
     // alive receiver — watch this for Chrome disconnect.
     let mut browser_alive = browser.alive();
@@ -61,19 +85,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Frame counter for throttled URL refresh (every 30 frames).
     let mut frame_count: u64 = 0;
 
-    // One-shot re-sync shortly after startup: the first screencast frames can be
-    // captured before the headless window/viewport fully settles, leaving the
-    // image slightly smaller than the terminal. Re-running the resize path once
-    // it has settled makes the page fill exactly (same effect as a manual
-    // resize, which the user observed fixes it).
+    // One-shot re-sync ~500ms after launch, plus a re-sync when the capture size
+    // changes (relayout). These keep the page filling the terminal.
     let startup_resync = tokio::time::sleep(Duration::from_millis(500));
     tokio::pin!(startup_resync);
     let mut resynced = false;
-
-    // Track the screencast frame size; when it changes (e.g. a video going
-    // fullscreen or other dynamic relayout that doesn't fire a load event), the
-    // capture no longer matches the viewport, so re-sync. Debounced so the
-    // restart-induced frames don't cause a loop.
     let mut last_frame_dims: Option<(u32, u32)> = None;
     let mut last_resync = std::time::Instant::now();
 
@@ -82,17 +98,33 @@ pub async fn run(cfg: Config) -> Result<()> {
             // Frame branch: render the latest frame + status bar.
             maybe = frames.recv() => {
                 let Some(f) = maybe else { break; };
+                // Backpressure: if too many frames are awaiting kitty's ack, drop
+                // this one (the channel keeps the latest, so we render the newest
+                // frame once a slot frees). If acks dry up for longer than the
+                // stall timeout, assume they were lost, reset the counter, and
+                // force a frame through so a hiccup can't freeze the screen.
+                if gfx_acked && in_flight >= MAX_IN_FLIGHT {
+                    if last_transmit.elapsed() < stall_timeout {
+                        continue;
+                    }
+                    in_flight = 0;
+                }
                 if let Some((fw, fh)) = jpeg_dims(&f.jpeg) {
                     let changed = matches!(last_frame_dims, Some((lw, lh))
                         if (fw as i64 - lw as i64).abs() > 16 || (fh as i64 - lh as i64).abs() > 16);
                     last_frame_dims = Some((fw, fh));
                     if changed && last_resync.elapsed() > Duration::from_millis(400) {
                         last_resync = std::time::Instant::now();
-                        browser.set_viewport(vp, cfg.dpr).await?;
-                        let _ = browser.start_screencast(cfg.quality, dev).await;
+                        best_effort("set_viewport", browser.set_viewport(vp)).await;
+                        let _ = browser.start_screencast(cfg.quality, vp).await;
                     }
                 }
-                out.write_all(&renderer.present_jpeg_bytes(&f.jpeg))?;
+                let frame_bytes = renderer.present_jpeg_bytes(&f.jpeg);
+                if !frame_bytes.is_empty() {
+                    out.write_all(&frame_bytes)?;
+                    in_flight += 1;
+                    last_transmit = std::time::Instant::now();
+                }
                 // Throttled URL refresh: poll Chrome every 30 frames to catch
                 // in-page navigation (link clicks, GoBack, JS redirects, etc.)
                 // without incurring a round-trip on every frame.
@@ -119,11 +151,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                     let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
                     let mut reconnected = false;
                     for attempt in 1u64..=3 {
-                        match Browser::launch(&cfg, chrome.clone(), window_for(dev)).await {
+                        match Browser::launch(&cfg, chrome.clone(), window_for(vp)).await {
                             Ok((nb, nf)) => {
-                                if nb.set_viewport(vp, cfg.dpr).await.is_ok()
+                                if nb.set_viewport(vp).await.is_ok()
                                     && nb.navigate(&current_url).await.is_ok()
-                                    && nb.start_screencast(cfg.quality, dev).await.is_ok()
+                                    && nb.start_screencast(cfg.quality, vp).await.is_ok()
                                 {
                                     browser_alive = nb.alive();
                                     browser_nav = nb.navigated();
@@ -156,18 +188,16 @@ pub async fn run(cfg: Config) -> Result<()> {
                 let (c, r) = crossterm::terminal::size()?;
                 grid = GridSize { cols: c, rows: r };
                 vp = geometry::page_viewport(grid, cell, 1);
-                dev = dev_viewport(vp, cfg.dpr);
                 renderer.resize(grid, cell);
-                browser.set_viewport(vp, cfg.dpr).await?;
-                let _ = browser.start_screencast(cfg.quality, dev).await;
+                best_effort("set_viewport", browser.set_viewport(vp)).await;
+                let _ = browser.start_screencast(cfg.quality, vp).await;
             }
 
-            // Re-sync after a navigation completes: the new page is otherwise
-            // captured at a transitional size, breaking the full-window fit.
+            // Re-sync after a navigation completes so the new page fills.
             res = browser_nav.changed() => {
                 if res.is_ok() {
-                    browser.set_viewport(vp, cfg.dpr).await?;
-                    let _ = browser.start_screencast(cfg.quality, dev).await;
+                    best_effort("set_viewport", browser.set_viewport(vp)).await;
+                    let _ = browser.start_screencast(cfg.quality, vp).await;
                 }
             }
 
@@ -191,12 +221,34 @@ pub async fn run(cfg: Config) -> Result<()> {
                         RawInput::Mouse(ev) => mapper.on_mouse(ev),
                         RawInput::Resize => {
                             let (c, r) = crossterm::terminal::size()?;
-                            grid = GridSize { cols: c, rows: r };
-                            vp = geometry::page_viewport(grid, cell, 1);
-                            dev = dev_viewport(vp, cfg.dpr);
-                            renderer.resize(grid, cell);
-                            browser.set_viewport(vp, cfg.dpr).await?;
-                            let _ = browser.start_screencast(cfg.quality, dev).await;
+                            // Ignore no-op resizes (e.g. the spurious SIGWINCH some
+                            // terminals send at startup). Restarting the screencast
+                            // resets Chrome's capture from device resolution back to
+                            // logical (half-res, blurry), so only do it on a real
+                            // size change.
+                            if (c, r) != (grid.cols, grid.rows) {
+                                grid = GridSize { cols: c, rows: r };
+                                vp = geometry::page_viewport(grid, cell, 1);
+                                renderer.resize(grid, cell);
+                                ui.resize(grid);
+                                // Clear stale text (e.g. the old status bar row,
+                                // now mid-screen); the image (z=-1) survives ED,
+                                // and the next frame redraws status at the new row.
+                                out.write_all(b"\x1b[2J")?;
+                                out.flush()?;
+                                best_effort("set_viewport", browser.set_viewport(vp)).await;
+                                let _ = browser.start_screencast(cfg.quality, vp).await;
+                            }
+                            Action::None
+                        }
+                        // Graphics ack from kitty: it finished processing a
+                        // transmitted frame, so free one in-flight slot.
+                        RawInput::GfxAck => {
+                            if !gfx_acked {
+                                tracing::info!("backpressure engaged: terminal graphics acks detected");
+                            }
+                            gfx_acked = true;
+                            in_flight = in_flight.saturating_sub(1);
                             Action::None
                         }
                     };
@@ -232,7 +284,16 @@ pub async fn run(cfg: Config) -> Result<()> {
                             current_url = target;
                             url_buffer.clear();
                         }
-                        Action::UrlCancel => { url_buffer.clear(); }
+                        Action::UrlCancel => {
+                            url_buffer.clear();
+                            // Esc out of hint mode also routes here — erase labels.
+                            hint_buffer.clear();
+                            out.write_all(&renderer.clear_hint_boxes())?;
+                            if !drawn_hints.is_empty() {
+                                out.write_all(&ui.clear_hints(&drawn_hints))?;
+                                drawn_hints.clear();
+                            }
+                        }
                         Action::EnterHintMode => {
                             let clickables = browser.collect_clickables().await.unwrap_or_default();
                             if clickables.is_empty() {
@@ -246,20 +307,53 @@ pub async fn run(cfg: Config) -> Result<()> {
                                     let row = (c.y / cell.h as f64) as u16;
                                     (label.clone(), col, row)
                                 }).collect();
+                                // Bake the label backgrounds into the frame (z=-1
+                                // hides cell backgrounds), then draw the letters.
+                                out.write_all(&renderer.set_hint_boxes(hint_boxes(&overlay, cell)))?;
                                 out.write_all(&ui.hint_overlay(&overlay))?;
                                 out.flush()?;
+                                drawn_hints = overlay;
+                                hint_buffer.clear();
                             }
                         }
                         Action::HintKey(c) => {
-                            if let Some((_, target)) = hints.iter().find(|(l, _)| l == &c.to_string()) {
+                            // Accumulate keystrokes: labels can be multi-char
+                            // (>26 elements -> two letters), so a single key is
+                            // usually just a prefix, not a complete selection.
+                            hint_buffer.push(c);
+                            if let Some((_, target)) = hints.iter().find(|(l, _)| l.as_str() == hint_buffer.as_str()) {
+                                // Full label typed: click it and leave hint mode.
                                 let _ = browser.click(target.x, target.y, crate::terminal::mouse::MouseButton::Left).await;
-                                // Refresh URL after hint-based navigation (best-effort).
                                 if let Some(url) = browser.current_url().await {
                                     current_url = url;
                                 }
+                                mapper.mode = crate::input::Mode::Normal;
+                                hints.clear();
+                                hint_buffer.clear();
+                                out.write_all(&renderer.clear_hint_boxes())?;
+                                if !drawn_hints.is_empty() {
+                                    out.write_all(&ui.clear_hints(&drawn_hints))?;
+                                    drawn_hints.clear();
+                                }
+                                out.flush()?;
+                            } else {
+                                // Narrow to labels still matching the prefix.
+                                let matching: Vec<(String, u16, u16)> = drawn_hints
+                                    .iter()
+                                    .filter(|(l, _, _)| l.starts_with(&hint_buffer))
+                                    .cloned()
+                                    .collect();
+                                if matching.is_empty() {
+                                    // Stray key: ignore it, keep the prior prefix.
+                                    hint_buffer.pop();
+                                } else {
+                                    out.write_all(&renderer.set_hint_boxes(hint_boxes(&matching, cell)))?;
+                                    out.write_all(&ui.clear_hints(&drawn_hints))?;
+                                    out.write_all(&ui.hint_overlay(&matching))?;
+                                    out.flush()?;
+                                    drawn_hints = matching;
+                                }
                             }
-                            mapper.mode = crate::input::Mode::Normal;
-                            hints.clear();
                         }
                         Action::None => {}
                     }
@@ -282,6 +376,21 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
+/// Convert hint overlay entries (label, col, row) to frame-pixel rectangles for
+/// the renderer to bake in as label backgrounds. Each box spans the label's
+/// cells: width = label length × cell width, height = one cell.
+fn hint_boxes(overlay: &[(String, u16, u16)], cell: geometry::CellSize) -> Vec<crate::renderer::HintBox> {
+    overlay
+        .iter()
+        .map(|(label, col, row)| crate::renderer::HintBox {
+            x: *col as u32 * cell.w as u32,
+            y: *row as u32 * cell.h as u32,
+            w: label.chars().count() as u32 * cell.w as u32,
+            h: cell.h as u32,
+        })
+        .collect()
+}
+
 /// Draw the bottom status line (and the URL prompt when in URL-input mode).
 /// Each piece clears its line first, so shrinking text leaves no leftovers.
 fn write_status(
@@ -302,46 +411,52 @@ fn write_status(
     Ok(())
 }
 
-/// Read a JPEG's pixel dimensions from its SOF marker (to detect capture-size
-/// changes). Returns None if not a parseable JPEG.
-fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
-    if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
-        return None;
-    }
-    let mut i = 2;
-    while i + 9 < b.len() {
-        if b[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = b[i + 1];
-        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
-            let h = ((b[i + 5] as u32) << 8) | b[i + 6] as u32;
-            let w = ((b[i + 7] as u32) << 8) | b[i + 8] as u32;
-            return Some((w, h));
-        }
-        let len = ((b[i + 2] as usize) << 8) | b[i + 3] as usize;
-        i += 2 + len;
-    }
-    None
-}
-
-/// The page area in DEVICE pixels: logical viewport × dpr. Chrome renders at
-/// this resolution (via deviceScaleFactor) and the screencast captures it, so a
-/// native (1:1) placement fills the terminal's HiDPI backing store.
-fn dev_viewport(css: geometry::Viewport, dpr: f64) -> geometry::Viewport {
-    geometry::Viewport {
-        width_px: (css.width_px as f64 * dpr).round() as u32,
-        height_px: (css.height_px as f64 * dpr).round() as u32,
-    }
-}
-
 /// Compositor window size for the headless browser. Must be >= the (device)
 /// page viewport so the screencast doesn't crop the page; macOS new-headless
 /// insets the surface unpredictably, so a generous margin makes the captured
 /// surface reach (near) the full device viewport in both dimensions.
 fn window_for(dev: geometry::Viewport) -> (u32, u32) {
     (dev.width_px + 600, dev.height_px + 600)
+}
+
+/// Read a JPEG/PNG's pixel dimensions from its header (to detect capture-size
+/// changes for the re-sync). Returns None if not parseable.
+fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() >= 24 && &b[0..8] == b"\x89PNG\r\n\x1a\n" {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        return Some((w, h));
+    }
+    if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF { i += 1; continue; }
+            let m = b[i + 1];
+            if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
+                let h = ((b[i + 5] as u32) << 8) | b[i + 6] as u32;
+                let w = ((b[i + 7] as u32) << 8) | b[i + 8] as u32;
+                return Some((w, h));
+            }
+            let len = ((b[i + 2] as usize) << 8) | b[i + 3] as usize;
+            i += 2 + len;
+        }
+    }
+    None
+}
+
+/// Await a CDP call with a short timeout; on timeout or error, log and continue
+/// instead of aborting. Chrome 149 + chromiumoxide 0.7.0 can hang a request
+/// whose response fails to deserialize, but the command itself still runs, so
+/// killing the app over it (a black screen) is worse than proceeding.
+async fn best_effort<F>(what: &str, fut: F)
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(Duration::from_secs(5), fut).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("{what} failed (continuing): {e}"),
+        Err(_) => tracing::warn!("{what} timed out (continuing)"),
+    }
 }
 
 fn normalize_url(input: &str) -> String {

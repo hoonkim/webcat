@@ -11,6 +11,9 @@ pub enum Error {
     #[error("chrome binary not found; set $WEBCAT_CHROME or install Google Chrome")]
     ChromeNotFound,
 
+    // Retained for completeness; webcat now falls back to a private temp profile
+    // instead of erroring when the default profile is in use.
+    #[allow(dead_code)]
     #[error("profile is locked by another webcat/chrome instance: {0}")]
     ProfileLocked(PathBuf),
 
