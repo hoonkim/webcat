@@ -14,13 +14,29 @@ A modal terminal web browser. It drives a headless Chromium instance over the Ch
 
 ---
 
-## Build
+## Install
 
-```bash
+### Homebrew (macOS)
+
+```sh
+brew install hoonkim/tap/webcat
+```
+
+Runtime dependencies — the Kitty terminal and Google Chrome:
+
+```sh
+brew install --cask kitty google-chrome
+```
+
+Upgrade later with `brew upgrade webcat`.
+
+### From source
+
+```sh
 cargo build --release
 ```
 
-The binary is written to `target/release/webcat`. Copy it anywhere on your `$PATH`.
+The binary is written to `target/release/webcat`; copy it anywhere on your `$PATH`.
 
 ---
 
