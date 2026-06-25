@@ -8,9 +8,24 @@ A modal terminal web browser. It drives a headless Chromium instance over the Ch
 
 ## Requirements
 
-- **Kitty terminal** — the Kitty graphics protocol is required; other terminals are not supported (webcat prints an error and exits if the protocol is not detected).
+- **A compatible terminal** — webcat needs the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) **with the shared-memory transmission medium** (`t=s`), since it hands raw pixels to the terminal through POSIX shared memory rather than the PTY. See [Supported terminals](#supported-terminals) below. (webcat prints an error and exits if the protocol is not detected.)
 - **Google Chrome or Chromium** — a recent version must be installed. webcat launches it in headless mode.
-- **Rust toolchain** — to build from source (stable, 2021 edition). macOS or Linux.
+- **Rust toolchain** — only to build from source (stable, 2021 edition). macOS or Linux.
+
+### Supported terminals
+
+Any terminal that implements the Kitty graphics protocol **and** its shared-memory (`t=s`) transmission, running **locally** (shared memory is same-machine only — it does not work over SSH). Confirmed:
+
+| Terminal | Notes |
+|----------|-------|
+| [kitty](https://sw.kovidgoyal.net/kitty/) | the reference implementation |
+| [Ghostty](https://ghostty.org/) | and Ghostty-based terminals (e.g. **cmux**) |
+| [WezTerm](https://wezterm.org/) | shared-memory support added in [#1810](https://github.com/wezterm/wezterm/pull/1810) |
+| [Konsole](https://konsole.kde.org/) | KDE |
+| [Warp](https://www.warp.dev/) | |
+| [iTerm2](https://iterm2.com/) | recent versions |
+
+> **Not supported:** terminals without the graphics protocol (Alacritty, Terminal.app, GNOME Terminal, …), and browser-based terminals like xterm.js (no POSIX shared memory). Remote/SSH sessions won't work either — the pixels are passed via local shared memory.
 
 ---
 
@@ -155,11 +170,11 @@ Log output goes to `$XDG_STATE_HOME/webcat/log` (typically `~/.local/state/webca
 - **Single page, no tabs** — webcat manages one browser page.
 - **Soft image** — up-scaled screencast frames are slightly blurry; pixel-perfect rendering would require an embedded engine (CEF) with partial-frame updates.
 - **No in-field IME preedit** — the composition underline isn't shown; committed text appears correctly.
-- **Requires Kitty** — the graphics protocol isn't available in other terminals (xterm, iTerm2, GNOME Terminal, etc.).
+- **Needs a graphics-protocol terminal, locally** — requires the Kitty graphics protocol with shared-memory transmission (see [Supported terminals](#supported-terminals)); shared memory is same-machine only, so it does not work over SSH.
 
 ---
 
-## Manual acceptance checklist (run in Kitty)
+## Manual acceptance checklist (run in a supported terminal)
 
 1. **Navigation** — `webcat example.com`, verify the page renders and fills the window.
 2. **Scroll** — `j`/`k` and the mouse wheel scroll in both directions.
