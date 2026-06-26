@@ -66,18 +66,21 @@ impl Browser {
         let profile_dir = profile::resolve_profile(&cfg.profile_dir);
         profile::prepare_profile(&profile_dir)?;
 
-        // The screencast captures the compositor WINDOW surface, not the
+        // The screencast captures the compositor WINDOW surface, not just the
         // device-metrics viewport. The window must therefore be at least as
         // large as the page viewport (otherwise the page is cropped to the
-        // window). We size it generously; the actual layout is still controlled
-        // by set_viewport (setDeviceMetricsOverride), and the renderer scales
-        // the captured frame to fill the terminal.
+        // window). We also force Chrome's compositor scale to match the viewport
+        // scale used below; otherwise Retina/macOS Chrome can acknowledge a
+        // high-DPI device metrics override while still streaming a logical-size
+        // screencast frame, which kitty then has to upscale.
         let bc = BrowserConfig::builder()
             .chrome_executable(chrome)
             .user_data_dir(profile_dir)
             .new_headless_mode()
             .window_size(window.0, window.1)
             .arg("--remote-allow-origins=*")
+            .arg("--high-dpi-support=1")
+            .arg(force_device_scale_arg(cfg.zoom))
             // Hide the automation signal (navigator.webdriver). Combined with the
             // de-headlessed user agent set below, this lets sites like YouTube
             // that refuse automated/headless clients keep serving media beyond
@@ -397,6 +400,10 @@ impl Browser {
     }
 }
 
+fn force_device_scale_arg(scale: f64) -> String {
+    format!("--force-device-scale-factor={}", scale.clamp(0.5, 4.0))
+}
+
 // Called by dispatch_key; appears unused to integration test's standalone compile.
 #[allow(dead_code)]
 fn encode_mods(m: Mods) -> i64 {
@@ -429,5 +436,17 @@ fn key_to_cdp(key: Key) -> (i64, Option<String>) {
         Key::Delete    => (46,  None),
         Key::F(n)      => (111 + n as i64, None),
         Key::Char(c)   => (c.to_ascii_uppercase() as i64, Some(c.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::force_device_scale_arg;
+
+    #[test]
+    fn force_device_scale_arg_clamps_to_supported_range() {
+        assert_eq!(force_device_scale_arg(2.0), "--force-device-scale-factor=2");
+        assert_eq!(force_device_scale_arg(0.1), "--force-device-scale-factor=0.5");
+        assert_eq!(force_device_scale_arg(10.0), "--force-device-scale-factor=4");
     }
 }
