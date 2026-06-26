@@ -379,13 +379,40 @@ impl Browser {
     pub async fn collect_clickables(&self) -> Result<Vec<Clickable>> {
         let js = r#"
             (() => {
-              const sel = 'a,button,input,textarea,select,[role=button],[onclick]';
+              const sel = [
+                'a', 'button', 'input', 'textarea', 'select', 'summary',
+                '[role=button]', '[role=link]', '[role=menuitem]', '[role=option]',
+                '[role=tab]', '[role=checkbox]', '[role=radio]', '[role=row]',
+                '[onclick]', '[tabindex]', '[jsaction]', '[data-tooltip]'
+              ].join(',');
               const out = [];
+              const seen = new Set();
+              function isClickable(el) {
+                if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                const cs = getComputedStyle(el);
+                if (cs.visibility === 'hidden' || cs.display === 'none' || cs.pointerEvents === 'none') return false;
+                const name = el.tagName.toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                if (['a','button','input','textarea','select','summary'].includes(name)) return true;
+                if (['button','link','menuitem','option','tab','checkbox','radio'].includes(role)) return true;
+                if (role === 'row' && (el.hasAttribute('jsaction') || cs.cursor === 'pointer')) return true;
+                if (el.hasAttribute('onclick') || el.hasAttribute('jsaction')) return true;
+                if (el.tabIndex >= 0) return true;
+                return cs.cursor === 'pointer';
+              }
               for (const el of document.querySelectorAll(sel)) {
+                if (!isClickable(el)) continue;
                 const r = el.getBoundingClientRect();
                 if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0
-                    && r.top < innerHeight && r.left < innerWidth) {
-                  out.push([r.left + r.width/2, r.top + r.height/2]);
+                    && r.top < innerHeight && r.left < innerWidth
+                    && r.width < innerWidth * 0.98 && r.height < innerHeight * 0.8) {
+                  const x = Math.max(0, Math.min(innerWidth, r.left + r.width / 2));
+                  const y = Math.max(0, Math.min(innerHeight, r.top + r.height / 2));
+                  const key = Math.round(x / 4) + ':' + Math.round(y / 4);
+                  if (!seen.has(key)) {
+                    seen.add(key);
+                    out.push([x, y]);
+                  }
                 }
               }
               return JSON.stringify(out);

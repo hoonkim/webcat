@@ -27,8 +27,15 @@ pub fn parse_sgr_mouse(seq: &str) -> Option<MouseEvent> {
     let row = cy.checked_sub(1)?;
 
     let kind = if cb & 64 != 0 {
-        // wheel
-        if cb & 1 == 0 { MouseKind::WheelUp } else { MouseKind::WheelDown }
+        // Wheel buttons in SGR mouse mode are encoded in the low two bits:
+        // 0/1 are vertical up/down, 2/3 are horizontal left/right. Trackpads can
+        // emit horizontal wheel codes during a vertical gesture; do not treat
+        // them as vertical scroll or the page jitters up and down.
+        match cb & 0b11 {
+            0 => MouseKind::WheelUp,
+            1 => MouseKind::WheelDown,
+            _ => return None,
+        }
     } else if cb & 32 != 0 {
         MouseKind::Move
     } else {
@@ -60,6 +67,12 @@ mod tests {
     fn wheel_up_and_down() {
         assert!(matches!(parse_sgr_mouse("\x1b[<64;1;1M").unwrap().kind, MouseKind::WheelUp));
         assert!(matches!(parse_sgr_mouse("\x1b[<65;1;1M").unwrap().kind, MouseKind::WheelDown));
+    }
+
+    #[test]
+    fn horizontal_wheel_is_ignored() {
+        assert!(parse_sgr_mouse("\x1b[<66;1;1M").is_none());
+        assert!(parse_sgr_mouse("\x1b[<67;1;1M").is_none());
     }
 
     #[test]
