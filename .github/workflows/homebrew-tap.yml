@@ -1,0 +1,43 @@
+name: Update Homebrew tap
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Formula/webcat.rb
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          TAP_REPO: hoonkim/homebrew-tap
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set" >&2
+            exit 1
+          fi
+
+          tarball_url="https://github.com/${REPO}/archive/refs/tags/${TAG_NAME}.tar.gz"
+          sha256="$(curl -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+
+          cd tap
+          formula="Formula/webcat.rb"
+          SHA256="$sha256" ruby -0pi -e 'gsub(/url "https:\/\/github\.com\/hoonkim\/webcat\/archive\/refs\/tags\/v[^"]+\.tar\.gz"/, "url \"https://github.com/hoonkim/webcat/archive/refs/tags/#{ENV.fetch("TAG_NAME")}.tar.gz\""); gsub(/sha256 "[0-9a-f]{64}"/, "sha256 \"#{ENV.fetch("SHA256")}\"")' "$formula"
+
+          if git diff --quiet -- "$formula"; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+
+          git add "$formula"
+          git commit -m "webcat ${TAG_NAME}"
+          git push origin HEAD
