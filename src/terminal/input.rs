@@ -204,6 +204,11 @@ mod tests {
     }
 
     #[test]
+    fn ignores_kitty_key_release() {
+        assert!(classify("\x1b[27;1:3u").is_none());
+    }
+
+    #[test]
     fn classifies_sgr_mouse() {
         assert!(matches!(classify("\x1b[<0;5;9M"), Some(RawInput::Mouse(_))));
     }

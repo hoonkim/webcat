@@ -39,7 +39,7 @@ impl InputMapper {
             Key::Char('H') => Action::GoBack,
             Key::Char('j') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: line },
             Key::Char('k') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: -line },
-            Key::Up | Key::Down | Key::Left | Key::Right => Action::Key(ev.key, ev.mods),
+            Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => Action::Key(ev.key, ev.mods),
             // Normal mode is command-only: any other key (incl. printable text) is swallowed.
             _ => Action::None,
         }
@@ -140,6 +140,13 @@ mod tests {
         let mut m = mapper();
         // A printable letter that is not a command must be swallowed in Normal mode.
         assert!(matches!(m.on_key(ev(Key::Char('z'), Some("z"))), Action::None));
+    }
+
+    #[test]
+    fn esc_in_normal_mode_is_sent_to_page() {
+        let mut m = mapper();
+        assert!(matches!(m.on_key(ev(Key::Esc, None)), Action::Key(Key::Esc, _)));
+        assert!(matches!(m.mode, Mode::Normal));
     }
 
     #[test]

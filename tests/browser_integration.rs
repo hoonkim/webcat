@@ -9,6 +9,7 @@
 #[path = "../src/browser/mod.rs"] mod browser;
 
 use std::time::Duration;
+use terminal::keyboard::{Key, Mods};
 
 fn itest_enabled() -> bool {
     std::env::var("WEBCAT_ITEST").is_ok()
@@ -83,6 +84,37 @@ async fn collect_clickables_includes_gmail_style_rows() {
         clickables.iter().any(|c| c.x > 300.0 && c.x < 520.0 && c.y > 130.0 && c.y < 160.0),
         "expected Gmail-style row in clickables: {clickables:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn tab_key_moves_focus_between_page_controls() {
+    if !itest_enabled() { eprintln!("skipped (set WEBCAT_ITEST=1)"); return; }
+
+    let chrome = browser::profile::discover_chrome(None).expect("chrome");
+    let tmp = std::env::temp_dir().join(format!("webcat-tab-itest-{}", std::process::id()));
+    let cfg = config::Config {
+        profile_dir: tmp.clone(),
+        chrome: Some(chrome.clone()),
+        log_path: tmp.join("log"),
+        quality: 70,
+        zoom: 1.0,
+        start_url: "about:blank".into(),
+    };
+
+    let (b, _frames) = browser::Browser::launch(&cfg, chrome, (1024, 856)).await.expect("launch");
+    b.set_viewport(geometry::Viewport { width_px: 800, height_px: 600 }).await.unwrap();
+
+    let html = "data:text/html,<button id=a autofocus>A</button><button id=b>B</button>";
+    b.navigate(html).await.unwrap();
+    b.eval_string("document.getElementById('a').focus(); document.activeElement.id").await.unwrap();
+
+    b.dispatch_key(Key::Tab, Mods::none(), true).await.unwrap();
+    b.dispatch_key(Key::Tab, Mods::none(), false).await.unwrap();
+
+    let active = b.eval_string("document.activeElement.id").await.unwrap();
+    assert_eq!(active, "b");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

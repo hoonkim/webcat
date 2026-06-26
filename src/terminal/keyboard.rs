@@ -39,8 +39,14 @@ pub fn parse_kitty_key(seq: &str) -> Option<KeyEvent> {
     let mods_field = fields.next();
     let mods = match mods_field {
         Some(f) => {
-            // f may be "mods" or "mods:event-type"; we ignore event-type here.
-            let m = f.split(':').next()?.parse::<u32>().ok()?;
+            // f may be "mods" or "mods:event-type". The app synthesizes keyup
+            // after each keydown, so terminal release events would otherwise be
+            // interpreted as a second key press after mode changes.
+            let mut parts = f.split(':');
+            let m = parts.next()?.parse::<u32>().ok()?;
+            if matches!(parts.next(), Some("3")) {
+                return None;
+            }
             Mods::from_encoded(m)
         }
         None => Mods::none(),
@@ -87,10 +93,9 @@ mod tests {
     }
 
     #[test]
-    fn release_event_is_parsed() {
+    fn release_event_is_ignored() {
         // 'a', no mods (1), event-type 3 (release)
-        let ev = parse_kitty_key("\x1b[97;1:3u").unwrap();
-        assert!(matches!(ev.key, Key::Char('a')));
+        assert!(parse_kitty_key("\x1b[97;1:3u").is_none());
     }
 
     #[test]

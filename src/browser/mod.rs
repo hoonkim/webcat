@@ -288,12 +288,22 @@ impl Browser {
     }
 
     pub async fn dispatch_key(&self, key: Key, mods: Mods, down: bool) -> Result<()> {
-        let (vk, text) = key_to_cdp(key);
+        let key_def = key_to_cdp(key);
+        let event_type = if down && key_def.text.is_none() && key_def.key.len() > 1 {
+            DispatchKeyEventType::RawKeyDown
+        } else if down {
+            DispatchKeyEventType::KeyDown
+        } else {
+            DispatchKeyEventType::KeyUp
+        };
         let mut p = DispatchKeyEventParams::builder()
-            .r#type(if down { DispatchKeyEventType::KeyDown } else { DispatchKeyEventType::KeyUp })
+            .r#type(event_type)
             .modifiers(encode_mods(mods))
-            .windows_virtual_key_code(vk);
-        if let Some(t) = text {
+            .key(key_def.key)
+            .code(key_def.code)
+            .windows_virtual_key_code(key_def.key_code)
+            .native_virtual_key_code(key_def.key_code);
+        if let Some(t) = key_def.text {
             p = p.text(t);
         }
         let params = p.build().map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
@@ -446,34 +456,76 @@ fn encode_mods(m: Mods) -> i64 {
 /// Map a Key to (windows virtual key code, optional text to emit).
 // Called by dispatch_key; appears unused to integration test's standalone compile.
 #[allow(dead_code)]
-fn key_to_cdp(key: Key) -> (i64, Option<String>) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyDef {
+    key: String,
+    key_code: i64,
+    code: String,
+    text: Option<String>,
+}
+
+fn key_to_cdp(key: Key) -> KeyDef {
     match key {
-        Key::Enter     => (13,  Some("\r".into())),
-        Key::Backspace => (8,   None),
-        Key::Tab       => (9,   Some("\t".into())),
-        Key::Esc       => (27,  None),
-        Key::Up        => (38,  None),
-        Key::Down      => (40,  None),
-        Key::Left      => (37,  None),
-        Key::Right     => (39,  None),
-        Key::Home      => (36,  None),
-        Key::End       => (35,  None),
-        Key::PageUp    => (33,  None),
-        Key::PageDown  => (34,  None),
-        Key::Delete    => (46,  None),
-        Key::F(n)      => (111 + n as i64, None),
-        Key::Char(c)   => (c.to_ascii_uppercase() as i64, Some(c.to_string())),
+        Key::Enter     => key_def("Enter", 13, "Enter", Some("\r")),
+        Key::Backspace => key_def("Backspace", 8, "Backspace", None),
+        Key::Tab       => key_def("Tab", 9, "Tab", None),
+        Key::Esc       => key_def("Escape", 27, "Escape", None),
+        Key::Up        => key_def("ArrowUp", 38, "ArrowUp", None),
+        Key::Down      => key_def("ArrowDown", 40, "ArrowDown", None),
+        Key::Left      => key_def("ArrowLeft", 37, "ArrowLeft", None),
+        Key::Right     => key_def("ArrowRight", 39, "ArrowRight", None),
+        Key::Home      => key_def("Home", 36, "Home", None),
+        Key::End       => key_def("End", 35, "End", None),
+        Key::PageUp    => key_def("PageUp", 33, "PageUp", None),
+        Key::PageDown  => key_def("PageDown", 34, "PageDown", None),
+        Key::Delete    => key_def("Delete", 46, "Delete", None),
+        Key::F(n)      => key_def(format!("F{n}"), 111 + n as i64, format!("F{n}"), None),
+        Key::Char(c)   => {
+            let code = if c.is_ascii_alphabetic() {
+                format!("Key{}", c.to_ascii_uppercase())
+            } else if c.is_ascii_digit() {
+                format!("Digit{c}")
+            } else {
+                String::new()
+            };
+            KeyDef {
+                key: c.to_string(),
+                key_code: c.to_ascii_uppercase() as i64,
+                code,
+                text: Some(c.to_string()),
+            }
+        }
+    }
+}
+
+fn key_def(
+    key: impl Into<String>,
+    key_code: i64,
+    code: impl Into<String>,
+    text: Option<&str>,
+) -> KeyDef {
+    KeyDef {
+        key: key.into(),
+        key_code,
+        code: code.into(),
+        text: text.map(str::to_string),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::force_device_scale_arg;
+    use super::{force_device_scale_arg, key_def, key_to_cdp};
+    use crate::terminal::keyboard::Key;
 
     #[test]
     fn force_device_scale_arg_clamps_to_supported_range() {
         assert_eq!(force_device_scale_arg(2.0), "--force-device-scale-factor=2");
         assert_eq!(force_device_scale_arg(0.1), "--force-device-scale-factor=0.5");
         assert_eq!(force_device_scale_arg(10.0), "--force-device-scale-factor=4");
+    }
+
+    #[test]
+    fn tab_key_does_not_emit_text_character() {
+        assert_eq!(key_to_cdp(Key::Tab), key_def("Tab", 9, "Tab", None));
     }
 }
