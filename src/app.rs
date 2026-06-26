@@ -71,6 +71,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut drawn_hints: Vec<(String, u16, u16)> = Vec::new();
     // Keystrokes typed so far toward selecting a (possibly multi-char) hint.
     let mut hint_buffer = String::new();
+    // Last mouse position in device pixels. Keyboard scroll commands reuse this
+    // so sites with internal scrollers (Gmail) receive the wheel event over the
+    // same pane the user last interacted with; before any mouse input, fall back
+    // to the viewport center.
+    let mut last_mouse_pos: Option<(f64, f64)> = None;
     // Backpressure: bound how many transmitted frames may be awaiting kitty's
     // graphics ack. A backgrounded/slow kitty acks slowly, so we stop sending
     // (and let frames coalesce) instead of piling up multi-MB shm buffers.
@@ -264,18 +269,26 @@ pub async fn run(cfg: Config) -> Result<()> {
                     match action {
                         Action::Quit => { quit = true; break; }
                         // Coalesce hover moves; dispatched once after the batch.
-                        Action::MoveMouse { x, y } => { pending_move = Some((x, y)); }
+                        Action::MoveMouse { x, y } => {
+                            last_mouse_pos = Some((x, y));
+                            pending_move = Some((x, y));
+                        }
                         Action::InsertText(t) => { let _ = browser.insert_text(&t).await; }
                         Action::Key(k, m) => {
                             let _ = browser.dispatch_key(k, m, true).await;
                             let _ = browser.dispatch_key(k, m, false).await;
                         }
                         Action::ClickPixel { x, y, button } => {
+                            last_mouse_pos = Some((x, y));
                             // The click moves to its own point; drop a stale hover.
                             pending_move = None;
                             let _ = browser.click(x, y, button).await;
                         }
-                        Action::ScrollPixel { x, y, dy } => { let _ = browser.scroll(x, y, dy).await; }
+                        Action::ScrollPixel { x, y, dy } => {
+                            let (sx, sy) = scroll_target(x, y, last_mouse_pos, vp);
+                            last_mouse_pos = Some((sx, sy));
+                            let _ = browser.scroll(sx, sy, dy).await;
+                        }
                         Action::GoBack => browser.go_back().await,
                         Action::Reload => browser.reload().await,
                         // Mode switches are applied inside the mapper; the app just
@@ -486,6 +499,21 @@ fn window_for(dev: geometry::Viewport) -> (u32, u32) {
     (dev.width_px + 600, dev.height_px + 600)
 }
 
+fn scroll_target(
+    x: f64,
+    y: f64,
+    last_mouse_pos: Option<(f64, f64)>,
+    vp: geometry::Viewport,
+) -> (f64, f64) {
+    if x != 0.0 || y != 0.0 {
+        return (x, y);
+    }
+    last_mouse_pos.unwrap_or((
+        vp.width_px as f64 / 2.0,
+        vp.height_px as f64 / 2.0,
+    ))
+}
+
 /// Read a JPEG/PNG's pixel dimensions from its header (to detect capture-size
 /// changes for the re-sync). Returns None if not parseable.
 fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
@@ -547,4 +575,27 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{:02X}", b),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_scroll_uses_last_mouse_position() {
+        let vp = geometry::Viewport { width_px: 800, height_px: 600 };
+        assert_eq!(scroll_target(0.0, 0.0, Some((120.0, 240.0)), vp), (120.0, 240.0));
+    }
+
+    #[test]
+    fn keyboard_scroll_falls_back_to_viewport_center() {
+        let vp = geometry::Viewport { width_px: 801, height_px: 601 };
+        assert_eq!(scroll_target(0.0, 0.0, None, vp), (400.5, 300.5));
+    }
+
+    #[test]
+    fn mouse_wheel_keeps_actual_position() {
+        let vp = geometry::Viewport { width_px: 800, height_px: 600 };
+        assert_eq!(scroll_target(10.0, 20.0, Some((120.0, 240.0)), vp), (10.0, 20.0));
+    }
 }

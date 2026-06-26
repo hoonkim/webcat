@@ -77,14 +77,14 @@ impl InputMapper {
     }
 
     pub fn on_mouse(&mut self, ev: MouseEvent) -> Action {
-        let line = 3.0 * self.cell.h as f64;
+        let wheel = self.cell.h as f64;
         let (x, y) = cell_to_pixel(ev.col, ev.row, self.cell);
         match ev.kind {
             MouseKind::Down(MouseButton::Left) =>
                 Action::ClickPixel { x, y, button: MouseButton::Left },
             MouseKind::Down(b) => Action::ClickPixel { x, y, button: b },
-            MouseKind::WheelDown => Action::ScrollPixel { x, y, dy: line },
-            MouseKind::WheelUp => Action::ScrollPixel { x, y, dy: -line },
+            MouseKind::WheelDown => Action::ScrollPixel { x, y, dy: wheel },
+            MouseKind::WheelUp => Action::ScrollPixel { x, y, dy: -wheel },
             MouseKind::Move => Action::MoveMouse { x, y },
             MouseKind::Up(_) => Action::None,
         }
@@ -164,7 +164,7 @@ mod tests {
     fn wheel_scrolls() {
         let mut m = mapper();
         let a = m.on_mouse(MouseEvent { kind: MouseKind::WheelDown, col: 0, row: 0 });
-        assert!(matches!(a, Action::ScrollPixel { dy, .. } if dy > 0.0));
+        assert!(matches!(a, Action::ScrollPixel { dy, .. } if dy == 16.0));
     }
 
     #[test]
