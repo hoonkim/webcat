@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::browser::Browser;
@@ -558,11 +559,46 @@ fn normalize_url(input: &str) -> String {
     let t = input.trim();
     if t.contains("://") || t.starts_with("about:") {
         t.to_string()
+    } else if let Some(url) = file_url_if_path(t) {
+        url
     } else if t.contains('.') && !t.contains(' ') {
         format!("https://{t}")
     } else {
         format!("https://www.google.com/search?q={}", urlencode(t))
     }
+}
+
+fn file_url_if_path(input: &str) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    let path = expand_home(input);
+    if !path.exists() {
+        return None;
+    }
+    let abs = path.canonicalize().ok()?;
+    Some(format!("file://{}", encode_file_path(&abs)))
+}
+
+fn expand_home(input: &str) -> PathBuf {
+    if input == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(input))
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        dirs::home_dir().map(|home| home.join(rest)).unwrap_or_else(|| PathBuf::from(input))
+    } else {
+        PathBuf::from(input)
+    }
+}
+
+fn encode_file_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
 }
 
 fn urlencode(s: &str) -> String {
@@ -597,5 +633,29 @@ mod tests {
     fn mouse_wheel_keeps_actual_position() {
         let vp = geometry::Viewport { width_px: 800, height_px: 600 };
         assert_eq!(scroll_target(10.0, 20.0, Some((120.0, 240.0)), vp), (10.0, 20.0));
+    }
+
+    #[test]
+    fn normalize_url_uses_existing_file_paths() {
+        let dir = std::env::temp_dir().join(format!("webcat-url-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello world.html");
+        std::fs::write(&file, "<h1>hello</h1>").unwrap();
+
+        let url = normalize_url(file.to_str().unwrap());
+        assert!(url.starts_with("file:///"), "{url}");
+        assert!(url.ends_with("/hello%20world.html"), "{url}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_url_keeps_web_and_search_inputs() {
+        assert_eq!(normalize_url("https://example.com/a b"), "https://example.com/a b");
+        assert_eq!(normalize_url("example.com"), "https://example.com");
+        assert_eq!(
+            normalize_url("rust async book"),
+            "https://www.google.com/search?q=rust+async+book"
+        );
     }
 }

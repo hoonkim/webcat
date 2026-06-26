@@ -67,6 +67,8 @@ URL argument is normalised the same way as the `:` URL bar:
 ```bash
 webcat google.com          # → https://google.com
 webcat https://naver.com   # used as-is
+webcat ./report.html       # → file:///.../report.html
+webcat ~/Downloads/a.pdf   # opens a local PDF in Chrome's PDF viewer
 webcat "rust async book"   # → Google search
 ```
 
@@ -122,6 +124,7 @@ webcat is **modal**: Normal mode accepts commands; Insert mode forwards keystrok
 
 Type a URL or search query and press `Enter`. webcat normalises input:
 - contains `://` or starts with `about:` → used as-is;
+- existing local file path (`./page.html`, `/tmp/a.pdf`, `~/a.pdf`) → opened as `file://`;
 - looks like a hostname (contains `.`, no spaces) → `https://` is prepended;
 - otherwise → sent to Google as a search query.
 

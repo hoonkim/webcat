@@ -45,5 +45,8 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     });
+    // The stdin reader runs in a blocking task and can be parked in read().
+    // Do not make process exit wait for another keypress just to wake it.
+    rt.shutdown_timeout(std::time::Duration::from_millis(100));
     Ok(())
 }
