@@ -12,6 +12,14 @@ use crate::terminal::input::{input_stream, RawInput};
 use crate::ui::Ui;
 
 pub async fn run(cfg: Config) -> Result<()> {
+    // Resolve a leftover-browser conflict before touching the terminal: a
+    // previous webcat browser that never exited still holds the profile lock.
+    // Ask whether to kill it (and reuse the real profile) or open anonymously.
+    // Done here, before raw mode, so the prompt prints/reads on a normal screen.
+    if !resolve_profile_conflict(&cfg) {
+        return Ok(());
+    }
+
     crate::terminal::raw::install_panic_and_signal_hooks();
     let mut guard = crate::terminal::raw::RestoreGuard::enter()?;
 
@@ -374,6 +382,65 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     guard.restore();
     Ok(())
+}
+
+/// Handle a leftover-browser profile conflict before the UI starts.
+///
+/// If no *live* process holds the default profile, returns `true` immediately
+/// (the normal path). If one does, the user is asked whether to kill it and
+/// reuse the real profile (history, logins) or open anonymously in a throwaway
+/// profile. When stdin isn't a TTY (e.g. piped/automated), we can't ask, so we
+/// keep the historical behaviour and open anonymously without prompting.
+///
+/// Returns `false` only when the user chooses to quit.
+fn resolve_profile_conflict(cfg: &Config) -> bool {
+    use std::io::{IsTerminal, Write};
+
+    let Some(pid) = crate::browser::profile::detect_conflict(&cfg.profile_dir) else {
+        return true;
+    };
+
+    if !std::io::stdin().is_terminal() {
+        tracing::warn!("profile held by live process {pid}; stdin not a TTY, opening anonymously");
+        return true;
+    }
+
+    let mut err = std::io::stderr();
+    loop {
+        let _ = write!(
+            err,
+            "\nwebcat: a previous browser (pid {pid}) is still running and holds your profile.\n  \
+             [k] kill it and reuse your profile (history, logins)\n  \
+             [a] open anonymously in a temporary profile\n  \
+             [q] quit\nchoice [k/a/q]: ",
+        );
+        let _ = err.flush();
+
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            // EOF (e.g. ^D): treat as quit rather than looping forever.
+            let _ = writeln!(err);
+            return false;
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "k" | "kill" => {
+                if crate::browser::profile::kill_profile_holder(pid) {
+                    let _ = writeln!(err, "killed {pid}; reusing your profile.");
+                } else {
+                    let _ = writeln!(err, "could not kill {pid}; opening anonymously instead.");
+                }
+                return true;
+            }
+            "a" | "anon" | "anonymous" => {
+                let _ = writeln!(err, "opening anonymously.");
+                return true;
+            }
+            "q" | "quit" => return false,
+            _ => {
+                let _ = writeln!(err, "please type k, a, or q.");
+            }
+        }
+    }
 }
 
 /// Convert hint overlay entries (label, col, row) to frame-pixel rectangles for

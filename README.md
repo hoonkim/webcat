@@ -151,7 +151,7 @@ Labels appear over every clickable element. Type the label to click that element
 ## Notes & behaviour
 
 - **Image quality vs. fill** — the screencast captures a logical-resolution frame that webcat up-scales to fill the terminal, so the image is slightly soft. For sharper text use a lower `--zoom` (e.g. `--zoom 1`) and/or a higher `--quality`. True device-resolution crispness is a limitation of CDP screencast (it sends full frames, not partial updates).
-- **Multiple windows** — Chrome allows one instance per profile. webcat detects this: the first window uses the persistent profile (your logins), and additional windows fall back to a private temporary profile so they still run. A stale lock from a crashed instance is cleared automatically.
+- **Multiple windows / leftover browser** — Chrome allows one instance per profile. When a live webcat browser already holds the profile (a second window, or a previous session that didn't exit), webcat asks at startup whether to **kill** it and reuse your profile (logins, history) or open **anonymously** in a private temporary profile. A stale lock from a crashed instance is cleared automatically (no prompt). When stdin isn't a TTY, it opens anonymously without asking.
 - **New tabs stay in-tab** — links that would open a new tab (`target=_blank` / `window.open`) are redirected to the current tab, since webcat captures a single page.
 - **Passkeys / native prompts** — WebAuthn/passkey requests and notification-permission prompts (which need native UI that headless Chrome can't show) are declined immediately so the page falls back (e.g. to a password form) instead of freezing.
 - **YouTube and video** — the user agent is de-headlessed so sites that refuse automated clients keep serving media.
