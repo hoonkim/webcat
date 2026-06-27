@@ -4,7 +4,7 @@
 
 **Goal:** Add an opt-in embedded MCP server to webcat that exposes console logs, network logs, screenshots, and page control to an AI agent, plus a `~/.webcat/config.yaml` config layer and a `webcat mcp install` subcommand.
 
-**Architecture:** webcat keeps owning the single CDP `Page`. New CDP subscriptions (Network/Runtime/Log) push entries into a shared, bounded `ObservabilityStore`. An `rmcp` streamable-HTTP server runs as a tokio task on `127.0.0.1:<port>`, with tool handlers that read the store and call existing `Browser` methods. Activation is gated behind `--mcp` (read) and `--mcp-allow-control` (write), settable via `~/.webcat/config.yaml`.
+**Architecture:** webcat keeps owning the single CDP `Page`. New CDP subscriptions (Network/Runtime/Log) push entries into a shared, bounded `ObservabilityStore`. An `rmcp` streamable-HTTP server runs as a tokio task on `127.0.0.1:<port>`, with tool handlers that read the store and call the current live `Browser` through a shared handle that is updated on reconnect. Activation is gated behind `--mcp` (read) and `--mcp-allow-control` (write), settable via `~/.webcat/config.yaml`.
 
 **Tech Stack:** Rust, tokio, chromiumoxide 0.7 (CDP), rmcp (MCP SDK, streamable-http + axum), serde_yml (config), clap 4.
 
@@ -12,6 +12,10 @@
 
 - Rust edition 2021, rust-version 1.75 (from `Cargo.toml`) — do not use newer-edition-only syntax.
 - chromiumoxide is pinned at `0.7` with `default-features = false`, `features = ["tokio-runtime"]` — do not change.
+- Before implementing dependency-sensitive code, verify current APIs against primary sources:
+  - `rmcp`: check docs.rs/crates.io for the latest version and feature names. As of 2026-06-27, docs.rs shows `rmcp` **1.8.0** with `transport-streamable-http-server`; prefer the latest compatible 1.x unless it raises MSRV beyond this crate's `rust-version = "1.75"`.
+  - `chromiumoxide`: this repo is pinned to `0.7`; verify exact generated CDP types locally in `~/.cargo/registry/src/.../chromiumoxide_cdp-0.7.0/src/cdp.rs` and `chromiumoxide-0.7.0` docs/source before writing field/method names.
+  - Do not guess constructors, module paths, or generated CDP field names. Compile after each dependency-facing task.
 - MCP server binds **only** `127.0.0.1` (never `0.0.0.0`).
 - MCP server is **off by default**; read tools require `mcp.enabled`/`--mcp`; write (control) tools additionally require `mcp.allow_control`/`--mcp-allow-control`.
 - Config precedence is **CLI/env > `~/.webcat/config.yaml` > built-in default**.
@@ -297,6 +301,7 @@ Add `FileConfig` and merge it into `Config::resolve` with correct precedence.
   - `Config` gains field `pub mcp: McpConfig`
   - `pub fn load_file_config() -> Result<Option<FileConfig>>` reading `~/.webcat/config.yaml`
   - `Config::resolve(cli: Cli, file: Option<FileConfig>) -> Result<Config>` (signature changes — add the `file` arg)
+  - `Cli` exposes accessors for settings whose explicit presence must override the file (`quality`, `mcp()`, `mcp_allow_control()`), so CLI precedence is implementable.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -323,11 +328,21 @@ Add to the `tests` module in `src/config.rs` (and update the existing `base_cli(
     #[test]
     fn cli_flag_overrides_file_for_mcp_enabled() {
         let mut cli = base_cli();
-        cli.mcp = true; // CLI explicitly on
+        cli.mcp_on = true; // CLI explicitly on
         let mut file = file_with_mcp();
         file.mcp.as_mut().unwrap().enabled = Some(false); // file says off
         let cfg = Config::resolve(cli, Some(file)).unwrap();
         assert!(cfg.mcp.enabled, "CLI --mcp must win over file enabled:false");
+    }
+
+    #[test]
+    fn cli_no_mcp_overrides_file_enabled_true() {
+        let mut cli = base_cli();
+        cli.mcp_off = true; // CLI explicitly off via --no-mcp
+        let mut file = file_with_mcp();
+        file.mcp.as_mut().unwrap().enabled = Some(true);
+        let cfg = Config::resolve(cli, Some(file)).unwrap();
+        assert!(!cfg.mcp.enabled, "CLI --no-mcp must win over file enabled:true");
     }
 
     #[test]
@@ -340,15 +355,20 @@ Add to the `tests` module in `src/config.rs` (and update the existing `base_cli(
 
     #[test]
     fn file_quality_used_when_cli_default() {
-        // CLI quality defaults to 92; when the user did not pass --quality the
-        // file value should apply. Represented by base_cli() carrying the clap
-        // default; resolve treats file as lower precedence than an explicit CLI.
+        let mut file = file_with_mcp();
+        file.quality = Some(50);
+        let cfg = Config::resolve(base_cli(), Some(file)).unwrap();
+        assert_eq!(cfg.quality, 50);
+    }
+
+    #[test]
+    fn explicit_cli_default_quality_still_overrides_file() {
         let mut cli = base_cli();
-        cli.quality = 92; // clap default sentinel
+        cli.quality = Some(92); // explicitly passed --quality 92
         let mut file = file_with_mcp();
         file.quality = Some(50);
         let cfg = Config::resolve(cli, Some(file)).unwrap();
-        assert_eq!(cfg.quality, 50);
+        assert_eq!(cfg.quality, 92);
     }
 ```
 
@@ -413,18 +433,13 @@ impl Config {
     pub fn resolve(cli: Cli, file: Option<FileConfig>) -> Result<Config> {
         let file = file.unwrap_or_default();
         let fmcp = file.mcp.unwrap_or_default();
+        let cli_mcp = cli.mcp();
+        let cli_mcp_allow_control = cli.mcp_allow_control();
 
         let profile_dir = cli.profile_dir.unwrap_or_else(default_profile_dir);
         let log_path = default_log_path();
 
-        // quality: explicit CLI (non-default) > file > default.
-        // clap default is 92; treat 92 as "unset" for file precedence.
-        let quality = if cli.quality != 92 {
-            cli.quality
-        } else {
-            file.quality.unwrap_or(92)
-        }
-        .clamp(1, 100);
+        let quality = cli.quality.or(file.quality).unwrap_or(92).clamp(1, 100);
 
         let zoom = match cli.zoom {
             Some(z) if z > 0.0 => z.clamp(0.5, 4.0),
@@ -435,9 +450,9 @@ impl Config {
         };
 
         let mcp = McpConfig {
-            enabled: cli.mcp || fmcp.enabled.unwrap_or(false),
+            enabled: cli_mcp.or(fmcp.enabled).unwrap_or(false),
             port: cli.mcp_port.or(fmcp.port),
-            allow_control: cli.mcp_allow_control || fmcp.allow_control.unwrap_or(false),
+            allow_control: cli_mcp_allow_control.or(fmcp.allow_control).unwrap_or(false),
         };
 
         Ok(Config {
@@ -453,7 +468,7 @@ impl Config {
 }
 ```
 
-> Note: this task assumes `Cli` already has `mcp`, `mcp_port`, `mcp_allow_control` fields (Task 3). If executing Task 2 before Task 3, add those three fields to `Cli` now (see Task 3 Step 3) so this compiles.
+> Note: this task assumes `Cli` already has `quality: Option<u8>`, `mcp_port`, `mcp_on/mcp_off`, `mcp_allow_control_on/mcp_allow_control_off`, plus the `mcp()` and `mcp_allow_control()` accessors (Task 3). If executing Task 2 before Task 3, add those fields and methods to `Cli` now (see Task 3 Step 3) so this compiles.
 
 Update existing tests' `base_cli()` to include the new fields:
 
@@ -461,8 +476,9 @@ Update existing tests' `base_cli()` to include the new fields:
     fn base_cli() -> Cli {
         Cli {
             command: None,
-            url: None, profile_dir: None, chrome: None, quality: 92, zoom: Some(1.0),
-            mcp: false, mcp_port: None, mcp_allow_control: false,
+            url: None, profile_dir: None, chrome: None, quality: None, zoom: Some(1.0),
+            mcp_on: false, mcp_off: false, mcp_port: None,
+            mcp_allow_control_on: false, mcp_allow_control_off: false,
         }
     }
 ```
@@ -501,11 +517,11 @@ Restructure `Cli` to support an optional `mcp` subcommand while preserving the n
 
 **Interfaces:**
 - Produces:
-  - `Cli` fields: existing + `pub command: Option<Command>`, `pub mcp: bool`, `pub mcp_port: Option<u16>`, `pub mcp_allow_control: bool`
+  - `Cli` fields: existing + `pub command: Option<Command>`, `pub quality: Option<u8>`, `pub mcp_on/mcp_off`, `pub mcp_port: Option<u16>`, `pub mcp_allow_control_on/mcp_allow_control_off`
   - `pub enum Command { Mcp(McpCmd) }`
   - `pub struct McpCmd { pub action: McpAction }`
   - `pub enum McpAction { Install(InstallArgs), Status, Uninstall(UninstallArgs) }`
-  - `pub struct InstallArgs { pub agent: AgentKind, pub port: Option<u16> }`
+  - `pub struct InstallArgs { pub agent: AgentKind, pub port: Option<u16>, pub allow_control: bool }`
   - `pub struct UninstallArgs { pub agent: AgentKind }`
   - `pub enum AgentKind { Claude, Print }` (clap `ValueEnum`, default `Claude`)
 
@@ -529,18 +545,34 @@ mod tests {
     #[test]
     fn mcp_flags_parse() {
         let cli = Cli::parse_from(["webcat", "--mcp", "--mcp-port", "4470", "--mcp-allow-control"]);
-        assert!(cli.mcp);
+        assert_eq!(cli.mcp(), Some(true));
         assert_eq!(cli.mcp_port, Some(4470));
-        assert!(cli.mcp_allow_control);
+        assert_eq!(cli.mcp_allow_control(), Some(true));
+    }
+
+    #[test]
+    fn mcp_negative_flags_parse() {
+        let cli = Cli::parse_from(["webcat", "--no-mcp", "--no-mcp-allow-control"]);
+        assert_eq!(cli.mcp(), Some(false));
+        assert_eq!(cli.mcp_allow_control(), Some(false));
+    }
+
+    #[test]
+    fn unset_quality_remains_none_for_config_precedence() {
+        let cli = Cli::parse_from(["webcat"]);
+        assert_eq!(cli.quality, None);
+        let cli = Cli::parse_from(["webcat", "--quality", "92"]);
+        assert_eq!(cli.quality, Some(92));
     }
 
     #[test]
     fn mcp_install_subcommand_parses() {
-        let cli = Cli::parse_from(["webcat", "mcp", "install", "--agent", "print", "--port", "5000"]);
+        let cli = Cli::parse_from(["webcat", "mcp", "install", "--agent", "print", "--port", "5000", "--allow-control"]);
         match cli.command {
             Some(Command::Mcp(McpCmd { action: McpAction::Install(a) })) => {
                 assert!(matches!(a.agent, AgentKind::Print));
                 assert_eq!(a.port, Some(5000));
+                assert!(a.allow_control);
             }
             _ => panic!("expected mcp install"),
         }
@@ -591,24 +623,50 @@ pub struct Cli {
     pub chrome: Option<PathBuf>,
 
     /// JPEG screencast quality 1-100.
-    #[arg(long, default_value_t = 92)]
-    pub quality: u8,
+    #[arg(long)]
+    pub quality: Option<u8>,
 
     /// Page zoom factor (clamped 0.5–4.0).
     #[arg(long)]
     pub zoom: Option<f64>,
 
     /// Enable the embedded MCP server (read tools). Overrides config `mcp.enabled`.
-    #[arg(long)]
-    pub mcp: bool,
+    #[arg(long = "mcp", conflicts_with = "no_mcp", action = clap::ArgAction::SetTrue)]
+    pub mcp_on: bool,
+
+    /// Disable the embedded MCP server even when config enables it.
+    #[arg(long = "no-mcp", id = "no_mcp", action = clap::ArgAction::SetTrue)]
+    pub mcp_off: bool,
 
     /// Port for the MCP server (default: OS-assigned, or config `mcp.port`).
     #[arg(long)]
     pub mcp_port: Option<u16>,
 
     /// Allow MCP control (write) tools: navigate/click/type/etc.
-    #[arg(long)]
-    pub mcp_allow_control: bool,
+    #[arg(long = "mcp-allow-control", conflicts_with = "no_mcp_allow_control", action = clap::ArgAction::SetTrue)]
+    pub mcp_allow_control_on: bool,
+
+    /// Disable MCP control tools even when config enables them.
+    #[arg(long = "no-mcp-allow-control", id = "no_mcp_allow_control", action = clap::ArgAction::SetTrue)]
+    pub mcp_allow_control_off: bool,
+}
+
+impl Cli {
+    pub fn mcp(&self) -> Option<bool> {
+        match (self.mcp_on, self.mcp_off) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    pub fn mcp_allow_control(&self) -> Option<bool> {
+        match (self.mcp_allow_control_on, self.mcp_allow_control_off) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -641,6 +699,9 @@ pub struct InstallArgs {
     /// Stable port to register (written to config). Defaults to config or 4470.
     #[arg(long)]
     pub port: Option<u16>,
+    /// Persist mcp.allow_control=true so agents can mutate the live page.
+    #[arg(long)]
+    pub allow_control: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -661,7 +722,7 @@ pub enum AgentKind {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test cli:: -- --nocapture`
-Expected: PASS (4 tests). Note: the whole crate may not yet compile because `main.rs`/`app.rs` use the old `Config::resolve` arity — that is fixed in Task 7. To test this task in isolation, run `cargo test --lib cli::` after confirming `cli.rs` compiles on its own; otherwise land Task 7's main wiring before running the full suite.
+Expected: PASS. This crate is a binary crate with no `src/lib.rs`, so do **not** use `cargo test --lib`. If Task 2 and Task 3 are split into separate commits, keep each commit compiling by updating `Config::resolve` call sites in the same commit that changes `Cli`.
 
 - [ ] **Step 5: Commit**
 
@@ -686,7 +747,7 @@ Wire Network/Runtime/Log events into the store, add `capture_screenshot`, and ad
   - `Browser::launch` signature gains `store: Arc<ObservabilityStore>` parameter
   - `pub async fn capture_screenshot(&self, jpeg: bool, quality: u8) -> Result<Vec<u8>>` (returns raw image bytes)
   - `pub async fn click_selector(&self, selector: &str) -> Result<()>`
-  - `pub fn current_url_sync(&self) -> Option<String>` already exists as `current_url` (async) — reuse it
+  - `pub async fn page_info(&self, vp: Option<Viewport>) -> Result<serde_json::Value>` returning `{ url, title, viewport, loading }`
   - free fn `fn console_args_to_text(args: &[serde_json::Value]) -> String` (unit-tested)
 
 - [ ] **Step 1: Write the failing unit test for the helper**
@@ -843,7 +904,7 @@ Then add subscription tasks alongside the existing ones (each follows the existi
                         seq: 0, ts_ms: 0, kind: "request".into(),
                         method: Some(e.request.method.clone()),
                         url: e.request.url.clone(), status: None, mime: None,
-                        request_id: e.request_id.inner().clone(),
+                        request_id: e.request_id.as_ref().to_string(),
                     });
                 }
             }
@@ -859,7 +920,7 @@ Then add subscription tasks alongside the existing ones (each follows the existi
                         seq: 0, ts_ms: 0, kind: "response".into(),
                         method: None, url: e.response.url.clone(),
                         status: Some(e.response.status), mime: Some(e.response.mime_type.clone()),
-                        request_id: e.request_id.inner().clone(),
+                        request_id: e.request_id.as_ref().to_string(),
                     });
                 }
             }
@@ -874,14 +935,14 @@ Then add subscription tasks alongside the existing ones (each follows the existi
                     fail_store.push_network(NetworkEntry {
                         seq: 0, ts_ms: 0, kind: "failed".into(),
                         method: None, url: String::new(), status: None,
-                        mime: None, request_id: e.request_id.inner().clone(),
+                        mime: None, request_id: e.request_id.as_ref().to_string(),
                     });
                 }
             }
         });
 ```
 
-> Field-name caution: the exact field names on these CDP structs (`request.method`, `response.status`, `response.mime_type`, `entry.level/text/url/line_number`, `request_id.inner()`) are from chromiumoxide_cdp 0.7. If any name mismatches at compile time, inspect the struct in `~/.cargo/registry/src/index.crates.io-*/chromiumoxide_cdp-0.7.0/src/cdp.rs` and adjust — do not guess.
+> Field-name caution: the exact field names on these CDP structs (`request.method`, `response.status`, `response.mime_type`, `entry.level/text/url/line_number`) are from chromiumoxide_cdp 0.7. `RequestId` is a newtype that implements `AsRef<str>`; use `request_id.as_ref().to_string()`, not `inner()`. If any name mismatches at compile time, inspect the struct in `~/.cargo/registry/src/index.crates.io-*/chromiumoxide_cdp-0.7.0/src/cdp.rs` and adjust from source — do not guess.
 
 Add the screenshot and selector-click methods (place near `start_screencast` / `click`):
 
@@ -905,6 +966,21 @@ Add the screenshot and selector-click methods (place near `start_screencast` / `
         base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))
+    }
+
+    pub async fn page_info(&self, vp: Option<Viewport>) -> Result<serde_json::Value> {
+        let url = self.current_url().await.unwrap_or_default();
+        let doc = self
+            .eval_string("JSON.stringify({ title: document.title, loading: document.readyState !== 'complete' })")
+            .await
+            .unwrap_or_else(|_| "{}".into());
+        let doc: serde_json::Value = serde_json::from_str(&doc).unwrap_or_default();
+        Ok(serde_json::json!({
+            "url": url,
+            "title": doc.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            "viewport": vp.map(|v| serde_json::json!({ "width_px": v.width_px, "height_px": v.height_px })),
+            "loading": doc.get("loading").and_then(|v| v.as_bool()).unwrap_or(false),
+        }))
     }
 
     /// Resolve a CSS selector to its center point and click it.
@@ -951,22 +1027,23 @@ Implement the rmcp handler exposing read + control tools, gated by `allow_contro
 - Test: inline unit tests for arg structs + a tool dispatch smoke test
 
 **Interfaces:**
-- Consumes: `Arc<ObservabilityStore>` (Task 1), `Arc<Browser>` (Task 4 — `Browser` must be shareable; wrap in `Arc`)
+- Consumes: `Arc<ObservabilityStore>` (Task 1), `CurrentBrowser = Arc<tokio::sync::RwLock<Arc<Browser>>>` (Task 4/7 — updated on reconnect)
 - Produces:
-  - `pub struct WebcatMcp { store: Arc<ObservabilityStore>, browser: Arc<Browser>, allow_control: bool }`
+  - `pub type CurrentBrowser = Arc<tokio::sync::RwLock<Arc<Browser>>>`
+  - `pub struct WebcatMcp { store: Arc<ObservabilityStore>, browser: CurrentBrowser, allow_control: bool }`
   - `pub async fn serve(addr: std::net::SocketAddr, mcp: WebcatMcp) -> Result<u16>` — binds, returns the actual bound port, spawns the server
   - tool methods (see below)
 
 - [ ] **Step 1: Add dependencies**
 
-In `Cargo.toml` `[dependencies]`:
+In `Cargo.toml` `[dependencies]` after checking the latest docs.rs/crates.io metadata:
 
 ```toml
-rmcp = { version = "0.9", features = ["server", "macros", "transport-streamable-http-server"] }
-axum = "0.7"
+rmcp = { version = "1.8", features = ["server", "macros", "transport-streamable-http-server"] }
+axum = "0.8"
 ```
 
-> Verify the current `rmcp` version on crates.io during execution and pin the latest 0.x; adjust feature names if they changed. The streamable-http server type is `rmcp::transport::streamable_http_server::tower::StreamableHttpService` with `LocalSessionManager`.
+> As of 2026-06-27, docs.rs lists `rmcp` 1.8.0. If the latest `rmcp` or `axum` raises MSRV above this crate's Rust 1.75 requirement, pin the newest compatible version instead and document the reason in the commit. Verify the streamable-http server type and feature names against docs.rs before writing code; do not rely on this snippet if the latest API changed.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -999,6 +1076,7 @@ Expected: FAIL — `control_guard` undefined.
 ```rust
 use std::sync::Arc;
 
+use base64::Engine;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use rmcp::{tool, tool_router};
@@ -1007,16 +1085,22 @@ use serde::Deserialize;
 use crate::browser::Browser;
 use crate::observability::{ConsolePage, NetworkPage, ObservabilityStore};
 
+pub type CurrentBrowser = Arc<tokio::sync::RwLock<Arc<Browser>>>;
+
 #[derive(Clone)]
 pub struct WebcatMcp {
     store: Arc<ObservabilityStore>,
-    browser: Arc<Browser>,
+    browser: CurrentBrowser,
     allow_control: bool,
 }
 
 impl WebcatMcp {
-    pub fn new(store: Arc<ObservabilityStore>, browser: Arc<Browser>, allow_control: bool) -> Self {
+    pub fn new(store: Arc<ObservabilityStore>, browser: CurrentBrowser, allow_control: bool) -> Self {
         WebcatMcp { store, browser, allow_control }
+    }
+
+    async fn browser(&self) -> Arc<Browser> {
+        self.browser.read().await.clone()
     }
 }
 
@@ -1055,6 +1139,9 @@ pub struct ClickParam { pub x: Option<f64>, pub y: Option<f64>, pub selector: Op
 pub struct TypeParam { pub text: String }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct KeyParam { pub key: String, pub mods: Option<Vec<String>> }
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct ScrollParam { pub dy: f64, pub x: Option<f64>, pub y: Option<f64> }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
@@ -1089,14 +1176,15 @@ impl WebcatMcp {
 
     #[tool(description = "Get current page URL and zoom")]
     async fn get_page_info(&self) -> Json<serde_json::Value> {
-        let url = self.browser.current_url().await.unwrap_or_default();
-        Json(serde_json::json!({ "url": url }))
+        let browser = self.browser().await;
+        Json(browser.page_info(None).await.unwrap_or_else(|_| serde_json::json!({})))
     }
 
     #[tool(description = "Capture a screenshot of the current page (png or jpeg)")]
     async fn capture_screenshot(&self, Parameters(p): Parameters<ShotParam>) -> Result<CallToolResult, ErrorData> {
         let jpeg = p.format.as_deref() == Some("jpeg");
-        let bytes = self.browser.capture_screenshot(jpeg, p.quality.unwrap_or(80)).await.map_err(to_err)?;
+        let browser = self.browser().await;
+        let bytes = browser.capture_screenshot(jpeg, p.quality.unwrap_or(80)).await.map_err(to_err)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let mime = if jpeg { "image/jpeg" } else { "image/png" };
         Ok(CallToolResult::success(vec![Content::image(b64, mime.to_string())]))
@@ -1105,17 +1193,19 @@ impl WebcatMcp {
     #[tool(description = "Navigate to a URL (requires control)")]
     async fn navigate(&self, Parameters(p): Parameters<NavigateParam>) -> Result<CallToolResult, ErrorData> {
         control_guard(self.allow_control)?;
-        self.browser.navigate(&p.url).await.map_err(to_err)?;
+        let browser = self.browser().await;
+        browser.navigate(&p.url).await.map_err(to_err)?;
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
     #[tool(description = "Click at x,y (device px) or a CSS selector (requires control)")]
     async fn click(&self, Parameters(p): Parameters<ClickParam>) -> Result<CallToolResult, ErrorData> {
         control_guard(self.allow_control)?;
+        let browser = self.browser().await;
         if let Some(sel) = p.selector {
-            self.browser.click_selector(&sel).await.map_err(to_err)?;
+            browser.click_selector(&sel).await.map_err(to_err)?;
         } else if let (Some(x), Some(y)) = (p.x, p.y) {
-            self.browser
+            browser
                 .click(x, y, crate::terminal::mouse::MouseButton::Left)
                 .await
                 .map_err(to_err)?;
@@ -1128,23 +1218,76 @@ impl WebcatMcp {
     #[tool(description = "Type text into the focused element (requires control)")]
     async fn type_text(&self, Parameters(p): Parameters<TypeParam>) -> Result<CallToolResult, ErrorData> {
         control_guard(self.allow_control)?;
-        self.browser.insert_text(&p.text).await.map_err(to_err)?;
+        let browser = self.browser().await;
+        browser.insert_text(&p.text).await.map_err(to_err)?;
+        Ok(CallToolResult::success(vec![Content::text("ok")]))
+    }
+
+    #[tool(description = "Press a key, optionally with modifiers (requires control)")]
+    async fn press_key(&self, Parameters(p): Parameters<KeyParam>) -> Result<CallToolResult, ErrorData> {
+        control_guard(self.allow_control)?;
+        let key = parse_key(&p.key).map_err(|e| ErrorData::invalid_request(e, None))?;
+        let mods = parse_mods(p.mods.as_deref()).map_err(|e| ErrorData::invalid_request(e, None))?;
+        let browser = self.browser().await;
+        browser.dispatch_key(key, mods, true).await.map_err(to_err)?;
+        browser.dispatch_key(key, mods, false).await.map_err(to_err)?;
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
     #[tool(description = "Scroll by dy at x,y (requires control)")]
     async fn scroll(&self, Parameters(p): Parameters<ScrollParam>) -> Result<CallToolResult, ErrorData> {
         control_guard(self.allow_control)?;
-        self.browser.scroll(p.x.unwrap_or(10.0), p.y.unwrap_or(10.0), p.dy).await.map_err(to_err)?;
+        let browser = self.browser().await;
+        browser.scroll(p.x.unwrap_or(10.0), p.y.unwrap_or(10.0), p.dy).await.map_err(to_err)?;
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
     #[tool(description = "Evaluate JavaScript and return the result string (requires control)")]
     async fn eval_js(&self, Parameters(p): Parameters<EvalParam>) -> Result<CallToolResult, ErrorData> {
         control_guard(self.allow_control)?;
-        let out = self.browser.eval_string(&p.script).await.map_err(to_err)?;
+        let browser = self.browser().await;
+        let out = browser.eval_string(&p.script).await.map_err(to_err)?;
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
+}
+```
+
+Add small parsers for `press_key` near `to_err`:
+
+```rust
+fn parse_key(s: &str) -> Result<crate::terminal::keyboard::Key, String> {
+    use crate::terminal::keyboard::Key;
+    Ok(match s {
+        "Enter" => Key::Enter,
+        "Backspace" => Key::Backspace,
+        "Tab" => Key::Tab,
+        "Escape" | "Esc" => Key::Esc,
+        "ArrowUp" | "Up" => Key::Up,
+        "ArrowDown" | "Down" => Key::Down,
+        "ArrowLeft" | "Left" => Key::Left,
+        "ArrowRight" | "Right" => Key::Right,
+        "Home" => Key::Home,
+        "End" => Key::End,
+        "PageUp" => Key::PageUp,
+        "PageDown" => Key::PageDown,
+        "Delete" => Key::Delete,
+        s if s.chars().count() == 1 => Key::Char(s.chars().next().unwrap()),
+        _ => return Err(format!("unsupported key: {s}")),
+    })
+}
+
+fn parse_mods(mods: Option<&[String]>) -> Result<crate::terminal::keyboard::Mods, String> {
+    let mut out = crate::terminal::keyboard::Mods::default();
+    for m in mods.unwrap_or(&[]) {
+        match m.as_str() {
+            "Alt" | "alt" => out.alt = true,
+            "Ctrl" | "Control" | "ctrl" | "control" => out.ctrl = true,
+            "Meta" | "Cmd" | "meta" | "cmd" => out.meta = true,
+            "Shift" | "shift" => out.shift = true,
+            _ => return Err(format!("unsupported modifier: {m}")),
+        }
+    }
+    Ok(out)
 }
 ```
 
@@ -1154,7 +1297,7 @@ impl WebcatMcp {
 
 ```rust
 mod server;
-pub use server::WebcatMcp;
+pub use server::{CurrentBrowser, WebcatMcp};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1323,7 +1466,7 @@ fn write_config_mcp(port: u16, allow_control: bool) -> Result<()> {
 }
 
 pub fn run_install(args: InstallArgs) -> Result<()> {
-    let port = resolve_and_persist_port(args.port, false)?;
+    let port = resolve_and_persist_port(args.port, args.allow_control)?;
     match args.agent {
         AgentKind::Print => {
             print!("{}", print_snippet(port));
@@ -1345,7 +1488,8 @@ pub fn run_install(args: InstallArgs) -> Result<()> {
     }
     println!(
         "\nNote: webcat must be running (with mcp enabled) for the agent to connect.\n\
-         Config written to ~/.webcat/config.yaml (mcp.enabled=true, port={port})."
+         Config written to ~/.webcat/config.yaml (mcp.enabled=true, port={port}, allow_control={}).",
+        args.allow_control
     );
     Ok(())
 }
@@ -1410,7 +1554,7 @@ git commit -m "feat: webcat mcp install/status/uninstall commands"
 
 ### Task 7: Wire everything into main + app (startup, dispatch, status bar)
 
-Dispatch subcommands, load file config, share `Browser` via `Arc`, start the MCP server, and show the control indicator.
+Dispatch subcommands, load file config, share the current `Browser` via an updateable handle, start the MCP server, and show the control indicator.
 
 **Files:**
 - Modify: `src/main.rs`
@@ -1447,15 +1591,17 @@ Adjust to match the existing `main` return type and the existing call that build
 
 - [ ] **Step 2: Share Browser via Arc and start the MCP server in app::run**
 
-In `src/app.rs`, construct the store, pass it to `Browser::launch`, wrap the browser in `Arc`, and start the server when enabled. Near the top of `run`:
+In `src/app.rs`, construct the store, pass it to `Browser::launch`, wrap the browser in `Arc`, then put it in a `CurrentBrowser` handle that MCP handlers can re-read after reconnect. Near the top of `run`:
 
 ```rust
     let store = std::sync::Arc::new(crate::observability::ObservabilityStore::new(2000));
-    let (browser, frame_rx) = Browser::launch(&cfg, chrome, window, store.clone()).await?;
-    let browser = std::sync::Arc::new(browser);
+    let (browser, mut frames) = Browser::launch(&cfg, chrome, window_for(vp), store.clone()).await?;
+    let mut browser = std::sync::Arc::new(browser);
+    let current_browser: crate::mcp::CurrentBrowser =
+        std::sync::Arc::new(tokio::sync::RwLock::new(browser.clone()));
 ```
 
-> Every existing `browser.method()` call in `app.rs` still works through the `Arc` deref. If any code moved `browser` by value, change it to use the `Arc` clone.
+> Every existing `browser.method()` call in `app.rs` still works through the `Arc` deref. If any code moved `browser` by value, change it to use the `Arc` clone. Keep the local `browser` variable for the TUI loop and the `current_browser` handle for MCP.
 
 After the browser is up and the viewport/screencast are configured, start the MCP server if enabled:
 
@@ -1466,7 +1612,7 @@ After the browser is up and the viewport/screencast are configured, start the MC
             std::net::Ipv4Addr::LOCALHOST,
             cfg.mcp.port.unwrap_or(0),
         ).into();
-        let handler = crate::mcp::WebcatMcp::new(store.clone(), browser.clone(), cfg.mcp.allow_control);
+        let handler = crate::mcp::WebcatMcp::new(store.clone(), current_browser.clone(), cfg.mcp.allow_control);
         match crate::mcp::serve(addr, handler).await {
             Ok(port) => {
                 mcp_control_active = cfg.mcp.allow_control;
@@ -1479,9 +1625,22 @@ After the browser is up and the viewport/screencast are configured, start the MC
     }
 ```
 
+In the existing reconnect branch, when a replacement browser is accepted, update both the TUI-local `browser` and the MCP handle:
+
+```rust
+let nb = std::sync::Arc::new(nb);
+browser_alive = nb.alive();
+browser_nav = nb.navigated();
+browser = nb.clone();
+*current_browser.write().await = nb;
+frames = nf;
+```
+
+This is required because webcat already replaces `Browser` after Chrome disconnects; without updating `current_browser`, MCP tools keep calling the stale page from the dead session.
+
 - [ ] **Step 3: Show the control indicator in the status bar**
 
-In `src/ui/mod.rs`, thread a `bool` for "MCP control active" into the status bar rendering and append `" 🤖 MCP"` when true. Follow the existing status-bar string-building code; pass `mcp_control_active` from `app.rs` into the `Ui` render call. (Exact wiring depends on the current `Ui` signature — adapt minimally; do not restructure the UI.)
+In `src/ui/mod.rs`, thread a `bool` for "MCP control active" into the status bar rendering and append `" MCP control active"` when true. Follow the existing status-bar string-building code; pass `mcp_control_active` from `app.rs` into the `Ui` render call. (Exact wiring depends on the current `Ui` signature — adapt minimally; do not restructure the UI.)
 
 - [ ] **Step 4: Run the full unit suite + clippy**
 
@@ -1537,5 +1696,6 @@ git commit -m "docs: document MCP agent integration and config.yaml"
 ## Self-Review Notes
 
 - **Spec coverage:** §3 connection/transport → Task 5; §3 read tools → Tasks 1,5; §3 control tools → Tasks 4,5; §4 architecture (store + server task) → Tasks 1,5,7; §5.1 store → Task 1; §5.2 CDP subs → Task 4; §5.3 tool surface → Task 5; §5.4 config → Task 2; §5.5 CLI → Task 3; §5.6 install → Task 6; §6 concurrency/indicator → Task 7; §7 error handling → Tasks 2 (config parse exit), 5/7 (bind failure keeps running), 5 (tool errors); §8 testing → unit tests across tasks + Task 7 integration/manual; §9 deps → Tasks 1,2,5.
-- **Known risk spots (flagged inline, must verify against pinned crate sources, not guessed):** exact chromiumoxide_cdp 0.7 field names (Task 4); exact rmcp 0.x constructor/module names — `Content::image`, `ErrorData::*`, `StreamableHttpService::new`, `LocalSessionManager` path (Tasks 5). These are the only places first-compile fixes are expected.
-- **Type consistency:** `ObservabilityStore` methods (`push_console`, `push_network`, `console_since`, `network_since`) and entry/page types are used identically in Tasks 1 and 5. `Config.mcp: McpConfig` defined in Task 2 is consumed in Task 7. `Cli` fields defined in Task 3 are consumed in Tasks 2 and 7. `mcp_url`/`claude_add_args` consistent within Task 6.
+- **Verified against pinned crate sources (no fix expected):** chromiumoxide_cdp 0.7 — `RequestId: AsRef<str>`, `CaptureScreenshotReturns.data: Binary`, `CommandResponse.result`, event field names; `terminal::keyboard::{Key, Mods}` variants used by `parse_key`/`parse_mods`; `eval_string` returns the JS string value so `JSON.stringify`-wrapped `click_selector`/`page_info` round-trip.
+- **Known risk spots (flagged inline, must verify against docs.rs, not guessed):** rmcp **1.8** constructor/module names — `Content::image`, `ErrorData::{invalid_request,internal_error}`, `StreamableHttpService::new` arg order, `session::local::LocalSessionManager` path, `#[tool_router(server_handler)]` macro (Task 5). This is the only place first-compile fixes are expected; if rmcp/axom latest raises MSRV above Rust 1.75, pin the newest compatible release.
+- **Type consistency:** `ObservabilityStore` methods (`push_console`, `push_network`, `console_since`, `network_since`) and entry/page types are used identically in Tasks 1 and 5. `Config.mcp: McpConfig` (Task 2) is consumed in Task 7. `Cli` tri-state flags + `mcp()`/`mcp_allow_control()` accessors (Task 3) are consumed in Task 2's `resolve`. `CurrentBrowser = Arc<RwLock<Arc<Browser>>>` (Task 5) is created and updated on reconnect in Task 7, matching spec §10. `InstallArgs.allow_control` (Task 3) is threaded through `run_install` → `write_config_mcp` (Task 6). `mcp_url`/`claude_add_args` consistent within Task 6.

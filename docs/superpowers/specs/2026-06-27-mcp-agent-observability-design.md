@@ -49,7 +49,7 @@ webcat already drives Chromium via `chromiumoxide` (Chrome DevTools Protocol). C
 ```
 
 - Single shared `tokio` runtime (webcat is already `tokio = { features = ["full"] }`). The MCP server runs as a spawned task.
-- MCP handlers hold an `Arc<Page>` (or an `Arc<Browser>` wrapper) and an `Arc<ObservabilityStore>`. Control tools call existing `Browser` methods; read tools read the store.
+- MCP handlers hold a current-browser handle (`Arc<RwLock<Arc<Browser>>>`) and an `Arc<ObservabilityStore>`. The handle is updated if webcat reconnects Chrome, so the agent keeps observing/controlling the same live session the human sees. Control tools call existing `Browser` methods; read tools read the store.
 - The MCP server is independent of the TUI render path — agent calls must not block the frame loop.
 
 ## 5. Components
@@ -81,7 +81,7 @@ Each handler maps the CDP payload to a store entry and pushes it.
 | `capture_screenshot` | `format?` (png/jpeg), `quality?` | MCP image content (base64) via `Page.captureScreenshot` |
 | `get_page_info` | — | `url, title, viewport, loading` |
 
-**Control** (only registered/enabled when `allow_control`)
+**Control** (registered for discoverability, but returns an MCP error unless `allow_control` is enabled)
 | tool | args | action |
 |---|---|---|
 | `navigate` | `url` | `Browser::navigate` |
@@ -109,7 +109,7 @@ Each handler maps the CDP payload to a store entry and pushes it.
 Optional subcommand; no subcommand preserves today's "open URL" behavior.
 ```
 webcat [URL] [flags]
-webcat mcp install   [--agent claude|print] [--port N]
+webcat mcp install   [--agent claude|print] [--port N] [--allow-control]
 webcat mcp status
 webcat mcp uninstall [--agent claude]
 ```
@@ -120,13 +120,13 @@ webcat mcp uninstall [--agent claude]
 2. Register the HTTP MCP server with the target agent:
    - `--agent claude` (default): invoke `claude mcp add --transport http webcat http://127.0.0.1:<port>/mcp` if the `claude` CLI is present; otherwise fall back to printing manual instructions.
    - `--agent print`: print the URL + a config snippet only, no side effects.
-3. Ensure `mcp.enabled` (and `allow_control` if requested) is set in config so the server auto-starts on the next `webcat` run.
+3. Ensure `mcp.enabled` (and `allow_control` when `--allow-control` is passed) is set in config so the server auto-starts on the next `webcat` run.
 4. Print a clear note: **webcat must be running for the agent to connect** (ephemeral embedded server).
 
 ## 6. Concurrency & Input Conflict
 - Control tools call existing `Browser` methods; CDP serializes commands, so concurrent human + agent input cannot corrupt state (semantic races are still possible).
 - `allow_control` opt-in is the primary guard.
-- Status bar shows `🤖 MCP control active` while control is enabled so the human is aware an agent may intervene.
+- Status bar shows `MCP control active` while control is enabled so the human is aware an agent may intervene.
 
 ## 7. Error Handling
 - **Config parse failure** → stderr message before raw mode, exit.
@@ -147,4 +147,5 @@ webcat mcp uninstall [--agent claude]
 ## 10. Open Items for the Implementation Plan
 - Confirm `rmcp` server transport API surface and exact route path.
 - Confirm `chromiumoxide` event enum names for Network/Runtime/Log events on the pinned 0.7 version.
-- Decide whether `Browser` is wrapped in an `Arc` newtype shared between the TUI loop and MCP handlers, or exposes a cloneable command handle.
+- Verify latest dependency APIs from primary sources before implementation: `rmcp` from docs.rs/crates.io latest compatible release, and `chromiumoxide`/`chromiumoxide_cdp` from the pinned 0.7 docs/source.
+- Use an updateable current-browser handle (`Arc<RwLock<Arc<Browser>>>`) so MCP survives webcat's existing browser reconnect path.
