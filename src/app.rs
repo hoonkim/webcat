@@ -6,8 +6,8 @@ use crate::browser::Browser;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::geometry::{self, CellSize, GridSize};
-use crate::input::{InputMapper, Mode};
 use crate::input::action::Action;
+use crate::input::{InputMapper, Mode};
 use crate::renderer::Renderer;
 use crate::terminal::input::{input_stream, RawInput};
 use crate::ui::Ui;
@@ -34,7 +34,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     let cell_raw = crate::terminal::capability::query_cell_size(Duration::from_millis(300));
     let (cols, rows) = crossterm::terminal::size()?;
     let mut grid = GridSize { cols, rows };
-    let cell = CellSize { w: cell_raw.w, h: cell_raw.h };
+    let cell = CellSize {
+        w: cell_raw.w,
+        h: cell_raw.h,
+    };
     // `vp` is the page capture area in DEVICE pixels — the size the screencast
     // captures and the renderer places 1:1, so it fills the terminal grid. The
     // page's CSS layout size is derived from this and the zoom factor inside the
@@ -42,7 +45,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut vp = geometry::page_viewport(grid, cell, 1);
 
     let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
-    let (mut browser, mut frames) = Browser::launch(&cfg, chrome, window_for(vp)).await?;
+    let store = std::sync::Arc::new(crate::observability::ObservabilityStore::new(2000));
+    let (browser, mut frames) =
+        Browser::launch(&cfg, chrome, window_for(vp), store.clone()).await?;
+    let mut browser = std::sync::Arc::new(browser);
+    let current_browser: crate::mcp::CurrentBrowser =
+        std::sync::Arc::new(tokio::sync::RwLock::new(browser.clone()));
     // Startup CDP calls are best-effort with a short timeout: Chrome 149 emits
     // some CDP responses chromiumoxide 0.7.0 can't deserialize, so a request can
     // occasionally never see its reply and hang. The command is still delivered
@@ -53,7 +61,32 @@ pub async fn run(cfg: Config) -> Result<()> {
     let start_url = normalize_url(&cfg.start_url);
     best_effort("set_viewport", browser.set_viewport(vp)).await;
     best_effort("navigate", browser.navigate(&start_url)).await;
-    best_effort("start_screencast", browser.start_screencast(cfg.quality, vp)).await;
+    best_effort(
+        "start_screencast",
+        browser.start_screencast(cfg.quality, vp),
+    )
+    .await;
+
+    let mut mcp_control_active = false;
+    if cfg.mcp.enabled {
+        let addr: std::net::SocketAddr =
+            (std::net::Ipv4Addr::LOCALHOST, cfg.mcp.port.unwrap_or(0)).into();
+        let handler = crate::mcp::WebcatMcp::new(
+            store.clone(),
+            current_browser.clone(),
+            cfg.mcp.allow_control,
+        );
+        match crate::mcp::serve(addr, handler).await {
+            Ok(port) => {
+                mcp_control_active = cfg.mcp.allow_control;
+                tracing::info!(
+                    "MCP server on http://127.0.0.1:{port}/mcp (control={})",
+                    cfg.mcp.allow_control
+                );
+            }
+            Err(e) => tracing::warn!("MCP server disabled: {e}"),
+        }
+    }
 
     let mut renderer = Renderer::new(grid, cell);
     let mut ui = Ui::new(grid);
@@ -95,6 +128,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut browser_alive = browser.alive();
     // navigation counter — re-sync viewport + screencast after each page load.
     let mut browser_nav = browser.navigated();
+    let mut browser_loading = browser.loading();
+    let mut page_loading = *browser_loading.borrow();
+    let mut loading_phase: u16 = 0;
+    let mut loading_tick = tokio::time::interval(Duration::from_millis(80));
+    loading_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Frame counter for throttled URL refresh (every 30 frames).
     let mut frame_count: u64 = 0;
@@ -130,7 +168,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                     if changed && last_resync.elapsed() > Duration::from_millis(400) {
                         last_resync = std::time::Instant::now();
                         best_effort("set_viewport", browser.set_viewport(vp)).await;
-                        let _ = browser.start_screencast(cfg.quality, vp).await;
+                        best_effort(
+                            "start_screencast",
+                            browser.start_screencast(cfg.quality, vp),
+                        )
+                        .await;
                     }
                 }
                 let frame_bytes = renderer.present_jpeg_bytes(&f.jpeg);
@@ -149,7 +191,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                     }
                 }
                 // Use cached current_url — no per-frame round-trip to Chrome.
-                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer)?;
+                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer, mcp_control_active, page_loading, loading_phase)?;
                 out.flush()?;
             }
 
@@ -165,15 +207,19 @@ pub async fn run(cfg: Config) -> Result<()> {
                     let chrome = crate::browser::profile::discover_chrome(cfg.chrome.as_deref())?;
                     let mut reconnected = false;
                     for attempt in 1u64..=3 {
-                        match Browser::launch(&cfg, chrome.clone(), window_for(vp)).await {
+                        match Browser::launch(&cfg, chrome.clone(), window_for(vp), store.clone()).await {
                             Ok((nb, nf)) => {
                                 if nb.set_viewport(vp).await.is_ok()
                                     && nb.navigate(&current_url).await.is_ok()
                                     && nb.start_screencast(cfg.quality, vp).await.is_ok()
                                 {
+                                    let nb = std::sync::Arc::new(nb);
                                     browser_alive = nb.alive();
                                     browser_nav = nb.navigated();
-                                    browser = nb;
+                                    browser_loading = nb.loading();
+                                    page_loading = *browser_loading.borrow();
+                                    browser = nb.clone();
+                                    *current_browser.write().await = nb;
                                     frames = nf;
                                     reconnected = true;
                                     break;
@@ -204,15 +250,37 @@ pub async fn run(cfg: Config) -> Result<()> {
                 vp = geometry::page_viewport(grid, cell, 1);
                 renderer.resize(grid, cell);
                 best_effort("set_viewport", browser.set_viewport(vp)).await;
-                let _ = browser.start_screencast(cfg.quality, vp).await;
+                best_effort(
+                    "start_screencast",
+                    browser.start_screencast(cfg.quality, vp),
+                )
+                .await;
             }
 
             // Re-sync after a navigation completes so the new page fills.
             res = browser_nav.changed() => {
                 if res.is_ok() {
                     best_effort("set_viewport", browser.set_viewport(vp)).await;
-                    let _ = browser.start_screencast(cfg.quality, vp).await;
+                    best_effort(
+                        "start_screencast",
+                        browser.start_screencast(cfg.quality, vp),
+                    )
+                    .await;
                 }
+            }
+
+            res = browser_loading.changed() => {
+                if res.is_ok() {
+                    page_loading = *browser_loading.borrow();
+                    write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer, mcp_control_active, page_loading, loading_phase)?;
+                    out.flush()?;
+                }
+            }
+
+            _ = loading_tick.tick(), if page_loading => {
+                loading_phase = loading_phase.wrapping_add(1);
+                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer, mcp_control_active, true, loading_phase)?;
+                out.flush()?;
             }
 
             // Input branch: drain the entire pending backlog in one iteration so
@@ -251,7 +319,11 @@ pub async fn run(cfg: Config) -> Result<()> {
                                 out.write_all(b"\x1b[2J")?;
                                 out.flush()?;
                                 best_effort("set_viewport", browser.set_viewport(vp)).await;
-                                let _ = browser.start_screencast(cfg.quality, vp).await;
+                                best_effort(
+                                    "start_screencast",
+                                    browser.start_screencast(cfg.quality, vp),
+                                )
+                                .await;
                             }
                             Action::None
                         }
@@ -301,8 +373,14 @@ pub async fn run(cfg: Config) -> Result<()> {
                         Action::UrlBackspace => { url_buffer.pop(); }
                         Action::UrlSubmit => {
                             let target = normalize_url(&url_buffer);
-                            let _ = browser.navigate(&target).await;
-                            // Update cached URL on successful submission.
+                            browser.begin_loading();
+                            let nav_browser = browser.clone();
+                            let nav_target = target.clone();
+                            tokio::spawn(async move {
+                                let _ = nav_browser.navigate(&nav_target).await;
+                            });
+                            // Show the submitted URL immediately; Chrome events
+                            // will reconcile it once navigation progresses.
                             current_url = target;
                             url_buffer.clear();
                         }
@@ -387,7 +465,8 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
                 // Redraw the status line immediately after input so URL editing
                 // and mode changes update even on static pages (no frame ticks).
-                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer)?;
+                page_loading = *browser_loading.borrow();
+                write_status(&mut out, &ui, mapper.mode, &current_url, &url_buffer, mcp_control_active, page_loading, loading_phase)?;
                 out.flush()?;
                 if quit { break; }
             }
@@ -460,7 +539,10 @@ fn resolve_profile_conflict(cfg: &Config) -> bool {
 /// Convert hint overlay entries (label, col, row) to frame-pixel rectangles for
 /// the renderer to bake in as label backgrounds. Each box spans the label's
 /// cells: width = label length × cell width, height = one cell.
-fn hint_boxes(overlay: &[(String, u16, u16)], cell: geometry::CellSize) -> Vec<crate::renderer::HintBox> {
+fn hint_boxes(
+    overlay: &[(String, u16, u16)],
+    cell: geometry::CellSize,
+) -> Vec<crate::renderer::HintBox> {
     overlay
         .iter()
         .map(|(label, col, row)| crate::renderer::HintBox {
@@ -480,12 +562,20 @@ fn write_status(
     mode: Mode,
     current_url: &str,
     url_buffer: &str,
+    mcp_control_active: bool,
+    loading: bool,
+    loading_phase: u16,
 ) -> std::io::Result<()> {
     let status = match mode {
         Mode::Insert => format!("-- INSERT --  {current_url}"),
         _ => current_url.to_string(),
     };
-    out.write_all(&ui.status_bar(&status, false))?;
+    let status = if mcp_control_active {
+        format!("{status}  MCP control active")
+    } else {
+        status
+    };
+    out.write_all(&ui.status_bar_frame(&status, loading, loading_phase))?;
     if mode == Mode::UrlInput {
         out.write_all(&ui.url_prompt(url_buffer))?;
     }
@@ -509,10 +599,7 @@ fn scroll_target(
     if x != 0.0 || y != 0.0 {
         return (x, y);
     }
-    last_mouse_pos.unwrap_or((
-        vp.width_px as f64 / 2.0,
-        vp.height_px as f64 / 2.0,
-    ))
+    last_mouse_pos.unwrap_or((vp.width_px as f64 / 2.0, vp.height_px as f64 / 2.0))
 }
 
 /// Read a JPEG/PNG's pixel dimensions from its header (to detect capture-size
@@ -526,7 +613,10 @@ fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
     if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
         let mut i = 2;
         while i + 9 < b.len() {
-            if b[i] != 0xFF { i += 1; continue; }
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
             let m = b[i + 1];
             if (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC {
                 let h = ((b[i + 5] as u32) << 8) | b[i + 6] as u32;
@@ -548,7 +638,7 @@ async fn best_effort<F>(what: &str, fut: F)
 where
     F: std::future::Future<Output = Result<()>>,
 {
-    match tokio::time::timeout(Duration::from_secs(5), fut).await {
+    match tokio::time::timeout(Duration::from_secs(1), fut).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!("{what} failed (continuing): {e}"),
         Err(_) => tracing::warn!("{what} timed out (continuing)"),
@@ -584,7 +674,9 @@ fn expand_home(input: &str) -> PathBuf {
     if input == "~" {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from(input))
     } else if let Some(rest) = input.strip_prefix("~/") {
-        dirs::home_dir().map(|home| home.join(rest)).unwrap_or_else(|| PathBuf::from(input))
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(input))
     } else {
         PathBuf::from(input)
     }
@@ -594,8 +686,9 @@ fn encode_file_path(path: &Path) -> String {
     path.to_string_lossy()
         .bytes()
         .map(|b| match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
             _ => format!("%{:02X}", b),
         })
         .collect()
@@ -619,20 +712,35 @@ mod tests {
 
     #[test]
     fn keyboard_scroll_uses_last_mouse_position() {
-        let vp = geometry::Viewport { width_px: 800, height_px: 600 };
-        assert_eq!(scroll_target(0.0, 0.0, Some((120.0, 240.0)), vp), (120.0, 240.0));
+        let vp = geometry::Viewport {
+            width_px: 800,
+            height_px: 600,
+        };
+        assert_eq!(
+            scroll_target(0.0, 0.0, Some((120.0, 240.0)), vp),
+            (120.0, 240.0)
+        );
     }
 
     #[test]
     fn keyboard_scroll_falls_back_to_viewport_center() {
-        let vp = geometry::Viewport { width_px: 801, height_px: 601 };
+        let vp = geometry::Viewport {
+            width_px: 801,
+            height_px: 601,
+        };
         assert_eq!(scroll_target(0.0, 0.0, None, vp), (400.5, 300.5));
     }
 
     #[test]
     fn mouse_wheel_keeps_actual_position() {
-        let vp = geometry::Viewport { width_px: 800, height_px: 600 };
-        assert_eq!(scroll_target(10.0, 20.0, Some((120.0, 240.0)), vp), (10.0, 20.0));
+        let vp = geometry::Viewport {
+            width_px: 800,
+            height_px: 600,
+        };
+        assert_eq!(
+            scroll_target(10.0, 20.0, Some((120.0, 240.0)), vp),
+            (10.0, 20.0)
+        );
     }
 
     #[test]
@@ -651,7 +759,10 @@ mod tests {
 
     #[test]
     fn normalize_url_keeps_web_and_search_inputs() {
-        assert_eq!(normalize_url("https://example.com/a b"), "https://example.com/a b");
+        assert_eq!(
+            normalize_url("https://example.com/a b"),
+            "https://example.com/a b"
+        );
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(
             normalize_url("rust async book"),

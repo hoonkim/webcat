@@ -80,6 +80,9 @@ webcat "rust async book"   # → Google search
 | `--quality <1-100>` | JPEG screencast quality (default: 92). Higher is sharper at the cost of larger frames. |
 | `--profile-dir <PATH>` | Chrome user-data directory (default: `$XDG_DATA_HOME/webcat/profile`). |
 | `--chrome <PATH>` | Path to the Chrome/Chromium binary. |
+| `--mcp` / `--no-mcp` | Enable or disable the embedded MCP server for AI-agent observation tools. |
+| `--mcp-port <PORT>` | Bind the MCP server to a specific localhost port. If omitted, the OS chooses one unless config sets `mcp.port`. |
+| `--mcp-allow-control` / `--no-mcp-allow-control` | Allow or deny MCP control tools such as navigate, click, type, scroll, and JavaScript eval. |
 
 ### Environment variables
 
@@ -88,6 +91,48 @@ webcat "rust async book"   # → Google search
 | `WEBCAT_CHROME` | Path to Chrome/Chromium binary (overridden by `--chrome`). |
 | `WEBCAT_PROFILE_DIR` | Chrome profile directory (overridden by `--profile-dir`). |
 | `WEBCAT_LOG_LEVEL` | Log level: `trace`, `debug`, `info`, `warn`, `error` (default: `info`). |
+
+---
+
+## MCP / AI Agent Integration
+
+webcat can expose the live browser session to an AI agent over an embedded MCP server. It is off by default and binds only to `127.0.0.1`.
+
+Quickstart:
+
+```sh
+webcat mcp install --agent claude --port 4470
+webcat --mcp --mcp-port 4470 https://example.com
+```
+
+Use `--mcp-allow-control` only when you want the agent to mutate the page:
+
+```sh
+webcat --mcp --mcp-port 4470 --mcp-allow-control https://example.com
+```
+
+The persistent config file is `~/.webcat/config.yaml`; it is the only file webcat stores under `~/.webcat`.
+
+```yaml
+quality: 92
+zoom: 1.0
+mcp:
+  enabled: true
+  port: 4470
+  allow_control: false
+```
+
+Commands:
+
+```sh
+webcat mcp install [--agent claude|print] [--port N] [--allow-control]
+webcat mcp status
+webcat mcp uninstall [--agent claude|print]
+```
+
+Read tools are available with `--mcp`: `get_console_logs`, `get_network_logs`, `capture_screenshot`, and `get_page_info`. `get_network_logs` includes request/response metadata and, when Chrome exposes them, full request and response bodies. Network bodies are kept only in the in-memory ring buffer; when the 512 MiB body budget is exceeded, old entries are evicted whole rather than truncated. Control tools are registered but reject calls unless `--mcp-allow-control` or `mcp.allow_control: true` is set: `navigate`, `click`, `type_text`, `press_key`, `scroll`, and `eval_js`.
+
+Security notes: the server never binds public interfaces, MCP is opt-in, and control requires a second explicit opt-in. The browser session is ephemeral; webcat must be running for the agent to connect.
 
 ---
 

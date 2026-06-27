@@ -30,17 +30,38 @@ impl Ui {
     }
 
     pub fn status_bar(&self, url: &str, loading: bool) -> Vec<u8> {
+        self.status_bar_frame(url, loading, 0)
+    }
+
+    pub fn status_bar_frame(&self, url: &str, loading: bool, phase: u16) -> Vec<u8> {
         let prefix = if loading { "⟳ " } else { "  " };
         let width = self.grid.cols as usize;
         let mut text = format!("{prefix}{url}");
         if text.chars().count() > width {
             text = text.chars().take(width).collect();
         }
+        if loading {
+            return self.animated_status_bar(&text, phase);
+        }
         format!(
             "\x1b[{};1H{CLEAR_LINE}{REVERSE}{text}{RESET}",
             self.bottom_row()
         )
         .into_bytes()
+    }
+
+    fn animated_status_bar(&self, text: &str, phase: u16) -> Vec<u8> {
+        let width = self.grid.cols as usize;
+        let mut chars: Vec<char> = text.chars().take(width).collect();
+        chars.resize(width, ' ');
+
+        let mut out = format!("\x1b[{};1H{CLEAR_LINE}", self.bottom_row());
+        for (idx, ch) in chars.into_iter().enumerate() {
+            let [r, g, b] = loading_bg(idx as u16, width as u16, phase);
+            out.push_str(&format!("\x1b[38;2;255;255;255m\x1b[48;2;{r};{g};{b}m{ch}"));
+        }
+        out.push_str(RESET);
+        out.into_bytes()
     }
 
     pub fn url_prompt(&self, buffer: &str) -> Vec<u8> {
@@ -76,6 +97,19 @@ impl Ui {
     }
 }
 
+fn loading_bg(col: u16, width: u16, phase: u16) -> [u8; 3] {
+    let width = width.max(1);
+    let pos = (col + width - (phase % width)) % width;
+    let band = width.max(12) / 3;
+    let dist = pos.min(width - pos) as f32;
+    let t = (1.0 - (dist / band as f32)).clamp(0.0, 1.0);
+    [
+        (28.0 + 44.0 * t) as u8,
+        (102.0 + 98.0 * t) as u8,
+        (142.0 + 85.0 * t) as u8,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +139,16 @@ mod tests {
     fn url_prompt_shows_buffer() {
         let out = String::from_utf8(ui().url_prompt("git")).unwrap();
         assert!(out.contains(": git"));
+    }
+
+    #[test]
+    fn loading_status_bar_paints_gradient_background() {
+        let out = String::from_utf8(ui().status_bar_frame("https://example.com", true, 3)).unwrap();
+        assert!(out.contains("\x1b[24;1H"));
+        assert!(out.contains("\x1b[48;2;"));
+        for ch in "example.com".chars() {
+            assert!(out.contains(ch));
+        }
     }
 
     #[test]

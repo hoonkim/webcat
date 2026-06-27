@@ -36,7 +36,7 @@ impl InputMapper {
             Key::Char('f') => { self.mode = Mode::Hint; Action::EnterHintMode }
             Key::Char('q') => Action::Quit,
             Key::Char('r') => Action::Reload,
-            Key::Char('H') => Action::GoBack,
+            Key::Char('H') | Key::Backspace => Action::GoBack,
             Key::Char('j') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: line },
             Key::Char('k') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: -line },
             Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => Action::Key(ev.key, ev.mods),
@@ -178,5 +178,12 @@ mod tests {
     fn q_quits_in_normal_mode() {
         let mut m = mapper();
         assert!(matches!(m.on_key(ev(Key::Char('q'), Some("q"))), Action::Quit));
+    }
+
+    #[test]
+    fn backspace_goes_back_in_normal_mode() {
+        let mut m = mapper();
+        assert!(matches!(m.on_key(ev(Key::Backspace, None)), Action::GoBack));
+        assert!(matches!(m.mode, Mode::Normal));
     }
 }

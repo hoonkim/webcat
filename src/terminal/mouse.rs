@@ -2,7 +2,13 @@
 pub enum MouseButton { Left, Middle, Right }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseKind { Down(MouseButton), Up(MouseButton), Move, WheelUp, WheelDown }
+pub enum MouseKind {
+    Down(MouseButton),
+    Up(MouseButton),
+    Move,
+    WheelUp,
+    WheelDown,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseEvent { pub kind: MouseKind, pub col: u16, pub row: u16 }
