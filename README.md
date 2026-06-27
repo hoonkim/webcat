@@ -150,11 +150,13 @@ webcat is **modal**: Normal mode accepts commands; Insert mode forwards keystrok
 | `:` | Open the URL bar (type a URL or search query, press Enter) |
 | `f` | Enter hint mode — labels every clickable element |
 | `j` / `k` | Scroll down / up |
-| `H` | Go back (browser history) |
+| `h` / `l` | Scroll left / right |
+| `H` / `Backspace` | Go back (browser history) |
+| `L` | Go forward (browser history) |
 | `r` | Reload the page |
 | `q` | Quit |
 | Mouse click | Click the element under the cursor |
-| Mouse scroll | Scroll the page |
+| Mouse scroll / trackpad scroll | Scroll the page vertically, horizontally, or diagonally |
 | Mouse move | Drives `:hover` states |
 
 ### Insert mode
@@ -182,6 +184,9 @@ Labels appear over every clickable element. Type the label to click that element
 - more → two-letter labels (`af`, `ad`, …) — type both letters; matching labels narrow as you type.
 
 `Esc` cancels.
+
+Scrolling while Hint mode is active temporarily hides the labels; they refresh
+after scrolling settles so labels stay aligned with the visible page.
 
 ---
 
@@ -225,13 +230,13 @@ Log output goes to `$XDG_STATE_HOME/webcat/log` (typically `~/.local/state/webca
 ## Manual acceptance checklist (run in a supported terminal)
 
 1. **Navigation** — `webcat example.com`, verify the page renders and fills the window.
-2. **Scroll** — `j`/`k` and the mouse wheel scroll in both directions.
+2. **Scroll** — `j`/`k`, `h`/`l`, and mouse/trackpad scroll move vertically and horizontally.
 3. **Click** — left-click a link; the page navigates.
 4. **Hints** — press `f`; labels appear; type a label (one or two letters); the target is clicked.
 5. **URL bar** — `:`, type `rust-lang.org`, Enter; page navigates.
 6. **Search** — `:`, type `rust async book`, Enter; Google search opens.
 7. **Korean** — focus a text field, `i`, switch OS IME to Korean, type `안녕하세요`; press `Esc`.
-8. **Back / Reload** — `H` goes back; `r` reloads.
+8. **History / Reload** — `H` or Backspace goes back; `L` goes forward; `r` reloads.
 9. **Resize** — resize the Kitty window; the page refits and the status bar follows the new bottom row.
 10. **Zoom** — relaunch with `--zoom 1` (sharper/smaller) and `--zoom 2.5` (larger); text size changes.
 11. **Quit** — `q` and Ctrl-C both fully restore the terminal (cursor visible, alternate screen gone).
