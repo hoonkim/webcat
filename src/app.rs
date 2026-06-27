@@ -105,6 +105,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut drawn_hints: Vec<(String, u16, u16)> = Vec::new();
     // Keystrokes typed so far toward selecting a (possibly multi-char) hint.
     let mut hint_buffer = String::new();
+    let mut hint_refresh_at: Option<tokio::time::Instant> = None;
     // Last mouse position in device pixels. Keyboard scroll commands reuse this
     // so sites with internal scrollers (Gmail) receive the wheel event over the
     // same pane the user last interacted with; before any mouse input, fall back
@@ -144,6 +145,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut resynced = false;
     let mut last_frame_dims: Option<(u32, u32)> = None;
     let mut last_resync = std::time::Instant::now();
+    let scroll_coalesce_window = Duration::from_millis(60);
+    let mut pending_scroll: Option<(f64, f64, f64, f64)> = None;
+    let mut scroll_flush_at: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -283,6 +287,43 @@ pub async fn run(cfg: Config) -> Result<()> {
                 out.flush()?;
             }
 
+            _ = async {
+                if let Some(t) = scroll_flush_at {
+                    tokio::time::sleep_until(t).await;
+                }
+            }, if scroll_flush_at.is_some() => {
+                scroll_flush_at = None;
+                if let Some((sx, sy, dx, dy)) = pending_scroll.take() {
+                    let (dx, dy) = filter_scroll_delta(dx, dy);
+                    if dx != 0.0 || dy != 0.0 {
+                        let _ = browser.scroll(sx, sy, dx, dy).await;
+                    }
+                }
+            }
+
+            _ = async {
+                if let Some(t) = hint_refresh_at {
+                    tokio::time::sleep_until(t).await;
+                }
+            }, if hint_refresh_at.is_some() => {
+                hint_refresh_at = None;
+                if mapper.mode == Mode::Hint {
+                    refresh_hint_overlay(
+                        &browser,
+                        &mut renderer,
+                        &ui,
+                        &mut out,
+                        &mut mapper,
+                        &mut hints,
+                        &mut drawn_hints,
+                        &mut hint_buffer,
+                        cell,
+                    )
+                    .await?;
+                    out.flush()?;
+                }
+            }
+
             // Input branch: drain the entire pending backlog in one iteration so
             // a click is never starved behind a flood of mouse-move events (and
             // interleaved frame renders). Mouse moves are coalesced to the latest
@@ -357,12 +398,32 @@ pub async fn run(cfg: Config) -> Result<()> {
                             pending_move = None;
                             let _ = browser.click(x, y, button).await;
                         }
-                        Action::ScrollPixel { x, y, dy } => {
+                        Action::ScrollPixel { x, y, dx, dy } => {
+                            if mapper.mode == Mode::Hint {
+                                hint_buffer.clear();
+                                clear_hint_overlay(
+                                    &mut renderer,
+                                    &ui,
+                                    &mut out,
+                                    &mut drawn_hints,
+                                )?;
+                                hint_refresh_at = Some(
+                                    tokio::time::Instant::now() + Duration::from_millis(200),
+                                );
+                            }
                             let (sx, sy) = scroll_target(x, y, last_mouse_pos, vp);
                             last_mouse_pos = Some((sx, sy));
-                            let _ = browser.scroll(sx, sy, dy).await;
+                            if let Some((_, _, pdx, pdy)) = pending_scroll {
+                                pending_scroll = Some((sx, sy, pdx + dx, pdy + dy));
+                            } else {
+                                pending_scroll = Some((sx, sy, dx, dy));
+                            }
+                            scroll_flush_at = Some(
+                                tokio::time::Instant::now() + scroll_coalesce_window,
+                            );
                         }
                         Action::GoBack => browser.go_back().await,
+                        Action::GoForward => browser.go_forward().await,
                         Action::Reload => browser.reload().await,
                         // Mode switches are applied inside the mapper; the app just
                         // acknowledges them (the status bar reflects mapper.mode).
@@ -388,33 +449,24 @@ pub async fn run(cfg: Config) -> Result<()> {
                             url_buffer.clear();
                             // Esc out of hint mode also routes here — erase labels.
                             hint_buffer.clear();
-                            out.write_all(&renderer.clear_hint_boxes())?;
-                            if !drawn_hints.is_empty() {
-                                out.write_all(&ui.clear_hints(&drawn_hints))?;
-                                drawn_hints.clear();
-                            }
+                            hint_refresh_at = None;
+                            clear_hint_overlay(&mut renderer, &ui, &mut out, &mut drawn_hints)?;
                         }
                         Action::EnterHintMode => {
-                            let clickables = browser.collect_clickables().await.unwrap_or_default();
-                            if clickables.is_empty() {
-                                mapper.mode = crate::input::Mode::Normal;
-                                out.write_all(&ui.status_bar("(no clickable elements)", false))?;
-                                out.flush()?;
-                            } else {
-                                hints = crate::input::hints::assign(&clickables);
-                                let overlay: Vec<(String, u16, u16)> = hints.iter().map(|(label, c)| {
-                                    let col = (c.x / cell.w as f64) as u16;
-                                    let row = (c.y / cell.h as f64) as u16;
-                                    (label.clone(), col, row)
-                                }).collect();
-                                // Bake the label backgrounds into the frame (z=-1
-                                // hides cell backgrounds), then draw the letters.
-                                out.write_all(&renderer.set_hint_boxes(hint_boxes(&overlay, cell)))?;
-                                out.write_all(&ui.hint_overlay(&overlay))?;
-                                out.flush()?;
-                                drawn_hints = overlay;
-                                hint_buffer.clear();
-                            }
+                            hint_refresh_at = None;
+                            refresh_hint_overlay(
+                                &browser,
+                                &mut renderer,
+                                &ui,
+                                &mut out,
+                                &mut mapper,
+                                &mut hints,
+                                &mut drawn_hints,
+                                &mut hint_buffer,
+                                cell,
+                            )
+                            .await?;
+                            out.flush()?;
                         }
                         Action::HintKey(c) => {
                             // Accumulate keystrokes: labels can be multi-char
@@ -423,19 +475,17 @@ pub async fn run(cfg: Config) -> Result<()> {
                             hint_buffer.push(c);
                             if let Some((_, target)) = hints.iter().find(|(l, _)| l.as_str() == hint_buffer.as_str()) {
                                 // Full label typed: click it and leave hint mode.
+                                let target = *target;
+                                mapper.mode = crate::input::Mode::Normal;
+                                hints.clear();
+                                hint_buffer.clear();
+                                hint_refresh_at = None;
+                                clear_hint_overlay(&mut renderer, &ui, &mut out, &mut drawn_hints)?;
+                                out.flush()?;
                                 let _ = browser.click(target.x, target.y, crate::terminal::mouse::MouseButton::Left).await;
                                 if let Some(url) = browser.current_url().await {
                                     current_url = url;
                                 }
-                                mapper.mode = crate::input::Mode::Normal;
-                                hints.clear();
-                                hint_buffer.clear();
-                                out.write_all(&renderer.clear_hint_boxes())?;
-                                if !drawn_hints.is_empty() {
-                                    out.write_all(&ui.clear_hints(&drawn_hints))?;
-                                    drawn_hints.clear();
-                                }
-                                out.flush()?;
                             } else {
                                 // Narrow to labels still matching the prefix.
                                 let matching: Vec<(String, u16, u16)> = drawn_hints
@@ -539,6 +589,57 @@ fn resolve_profile_conflict(cfg: &Config) -> bool {
 /// Convert hint overlay entries (label, col, row) to frame-pixel rectangles for
 /// the renderer to bake in as label backgrounds. Each box spans the label's
 /// cells: width = label length × cell width, height = one cell.
+async fn refresh_hint_overlay(
+    browser: &Browser,
+    renderer: &mut Renderer,
+    ui: &Ui,
+    out: &mut impl std::io::Write,
+    mapper: &mut InputMapper,
+    hints: &mut Vec<(String, crate::browser::Clickable)>,
+    drawn_hints: &mut Vec<(String, u16, u16)>,
+    hint_buffer: &mut String,
+    cell: geometry::CellSize,
+) -> std::io::Result<()> {
+    clear_hint_overlay(renderer, ui, out, drawn_hints)?;
+    hint_buffer.clear();
+
+    let clickables = browser.collect_clickables().await.unwrap_or_default();
+    if clickables.is_empty() {
+        mapper.mode = crate::input::Mode::Normal;
+        hints.clear();
+        out.write_all(&ui.status_bar("(no clickable elements)", false))?;
+        return Ok(());
+    }
+
+    *hints = crate::input::hints::assign(&clickables);
+    let overlay: Vec<(String, u16, u16)> = hints
+        .iter()
+        .map(|(label, c)| {
+            let col = (c.x / cell.w as f64) as u16;
+            let row = (c.y / cell.h as f64) as u16;
+            (label.clone(), col, row)
+        })
+        .collect();
+    out.write_all(&renderer.set_hint_boxes(hint_boxes(&overlay, cell)))?;
+    out.write_all(&ui.hint_overlay(&overlay))?;
+    *drawn_hints = overlay;
+    Ok(())
+}
+
+fn clear_hint_overlay(
+    renderer: &mut Renderer,
+    ui: &Ui,
+    out: &mut impl std::io::Write,
+    drawn_hints: &mut Vec<(String, u16, u16)>,
+) -> std::io::Result<()> {
+    out.write_all(&renderer.clear_hint_boxes())?;
+    if !drawn_hints.is_empty() {
+        out.write_all(&ui.clear_hints(drawn_hints))?;
+        drawn_hints.clear();
+    }
+    Ok(())
+}
+
 fn hint_boxes(
     overlay: &[(String, u16, u16)],
     cell: geometry::CellSize,
@@ -600,6 +701,22 @@ fn scroll_target(
         return (x, y);
     }
     last_mouse_pos.unwrap_or((vp.width_px as f64 / 2.0, vp.height_px as f64 / 2.0))
+}
+
+fn filter_scroll_delta(dx: f64, dy: f64) -> (f64, f64) {
+    const CROSS_AXIS_KEEP_RATIO: f64 = 0.45;
+    let ax = dx.abs();
+    let ay = dy.abs();
+    if ax == 0.0 || ay == 0.0 {
+        return (dx, dy);
+    }
+    if ax < ay * CROSS_AXIS_KEEP_RATIO {
+        (0.0, dy)
+    } else if ay < ax * CROSS_AXIS_KEEP_RATIO {
+        (dx, 0.0)
+    } else {
+        (dx, dy)
+    }
 }
 
 /// Read a JPEG/PNG's pixel dimensions from its header (to detect capture-size
@@ -741,6 +858,18 @@ mod tests {
             scroll_target(10.0, 20.0, Some((120.0, 240.0)), vp),
             (10.0, 20.0)
         );
+    }
+
+    #[test]
+    fn scroll_delta_filter_drops_minor_cross_axis_noise() {
+        assert_eq!(filter_scroll_delta(16.0, 64.0), (0.0, 64.0));
+        assert_eq!(filter_scroll_delta(64.0, 16.0), (64.0, 0.0));
+    }
+
+    #[test]
+    fn scroll_delta_filter_keeps_intentional_diagonal_motion() {
+        assert_eq!(filter_scroll_delta(32.0, 64.0), (32.0, 64.0));
+        assert_eq!(filter_scroll_delta(-64.0, 32.0), (-64.0, 32.0));
     }
 
     #[test]

@@ -481,6 +481,13 @@ impl Browser {
         )
         .await;
     }
+    pub async fn go_forward(&self) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.page.evaluate("history.forward()"),
+        )
+        .await;
+    }
     pub async fn reload(&self) {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -681,14 +688,19 @@ impl Browser {
         Ok(())
     }
 
-    pub async fn scroll(&self, x: f64, y: f64, dy: f64) -> Result<()> {
+    pub async fn scroll(&self, x: f64, y: f64, dx: f64, dy: f64) -> Result<()> {
         // Device → CSS pixels (position and scroll delta both scale by zoom).
-        let (x, y, dy) = (x / self.zoom, y / self.zoom, dy / self.zoom);
+        let (x, y, dx, dy) = (
+            x / self.zoom,
+            y / self.zoom,
+            dx / self.zoom,
+            dy / self.zoom,
+        );
         let params = DispatchMouseEventParams::builder()
             .r#type(DispatchMouseEventType::MouseWheel)
             .x(x)
             .y(y)
-            .delta_x(0.0f64)
+            .delta_x(dx)
             .delta_y(dy)
             .build()
             .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;

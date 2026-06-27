@@ -8,6 +8,8 @@ pub enum MouseKind {
     Move,
     WheelUp,
     WheelDown,
+    WheelLeft,
+    WheelRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,13 +36,12 @@ pub fn parse_sgr_mouse(seq: &str) -> Option<MouseEvent> {
 
     let kind = if cb & 64 != 0 {
         // Wheel buttons in SGR mouse mode are encoded in the low two bits:
-        // 0/1 are vertical up/down, 2/3 are horizontal left/right. Trackpads can
-        // emit horizontal wheel codes during a vertical gesture; do not treat
-        // them as vertical scroll or the page jitters up and down.
+        // 0/1 are vertical up/down, 2/3 are horizontal left/right.
         match cb & 0b11 {
             0 => MouseKind::WheelUp,
             1 => MouseKind::WheelDown,
-            _ => return None,
+            2 => MouseKind::WheelLeft,
+            _ => MouseKind::WheelRight,
         }
     } else if cb & 32 != 0 {
         MouseKind::Move
@@ -76,9 +77,9 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_wheel_is_ignored() {
-        assert!(parse_sgr_mouse("\x1b[<66;1;1M").is_none());
-        assert!(parse_sgr_mouse("\x1b[<67;1;1M").is_none());
+    fn horizontal_wheel_is_parsed() {
+        assert!(matches!(parse_sgr_mouse("\x1b[<66;1;1M").unwrap().kind, MouseKind::WheelLeft));
+        assert!(matches!(parse_sgr_mouse("\x1b[<67;1;1M").unwrap().kind, MouseKind::WheelRight));
     }
 
     #[test]

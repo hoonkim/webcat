@@ -37,8 +37,11 @@ impl InputMapper {
             Key::Char('q') => Action::Quit,
             Key::Char('r') => Action::Reload,
             Key::Char('H') | Key::Backspace => Action::GoBack,
-            Key::Char('j') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: line },
-            Key::Char('k') => Action::ScrollPixel { x: 0.0, y: 0.0, dy: -line },
+            Key::Char('L') => Action::GoForward,
+            Key::Char('h') => Action::ScrollPixel { x: 0.0, y: 0.0, dx: -line, dy: 0.0 },
+            Key::Char('l') => Action::ScrollPixel { x: 0.0, y: 0.0, dx: line, dy: 0.0 },
+            Key::Char('j') => Action::ScrollPixel { x: 0.0, y: 0.0, dx: 0.0, dy: line },
+            Key::Char('k') => Action::ScrollPixel { x: 0.0, y: 0.0, dx: 0.0, dy: -line },
             Key::Esc | Key::Up | Key::Down | Key::Left | Key::Right => Action::Key(ev.key, ev.mods),
             // Normal mode is command-only: any other key (incl. printable text) is swallowed.
             _ => Action::None,
@@ -83,8 +86,10 @@ impl InputMapper {
             MouseKind::Down(MouseButton::Left) =>
                 Action::ClickPixel { x, y, button: MouseButton::Left },
             MouseKind::Down(b) => Action::ClickPixel { x, y, button: b },
-            MouseKind::WheelDown => Action::ScrollPixel { x, y, dy: wheel },
-            MouseKind::WheelUp => Action::ScrollPixel { x, y, dy: -wheel },
+            MouseKind::WheelDown => Action::ScrollPixel { x, y, dx: 0.0, dy: wheel },
+            MouseKind::WheelUp => Action::ScrollPixel { x, y, dx: 0.0, dy: -wheel },
+            MouseKind::WheelRight => Action::ScrollPixel { x, y, dx: wheel, dy: 0.0 },
+            MouseKind::WheelLeft => Action::ScrollPixel { x, y, dx: -wheel, dy: 0.0 },
             MouseKind::Move => Action::MoveMouse { x, y },
             MouseKind::Up(_) => Action::None,
         }
@@ -175,6 +180,16 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_wheel_scrolls_sideways() {
+        let mut m = mapper();
+        let right = m.on_mouse(MouseEvent { kind: MouseKind::WheelRight, col: 0, row: 0 });
+        assert!(matches!(right, Action::ScrollPixel { dx, dy, .. } if dx == 16.0 && dy == 0.0));
+
+        let left = m.on_mouse(MouseEvent { kind: MouseKind::WheelLeft, col: 0, row: 0 });
+        assert!(matches!(left, Action::ScrollPixel { dx, dy, .. } if dx == -16.0 && dy == 0.0));
+    }
+
+    #[test]
     fn q_quits_in_normal_mode() {
         let mut m = mapper();
         assert!(matches!(m.on_key(ev(Key::Char('q'), Some("q"))), Action::Quit));
@@ -184,6 +199,26 @@ mod tests {
     fn backspace_goes_back_in_normal_mode() {
         let mut m = mapper();
         assert!(matches!(m.on_key(ev(Key::Backspace, None)), Action::GoBack));
+        assert!(matches!(m.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn h_and_l_scroll_sideways_in_normal_mode() {
+        let mut m = mapper();
+        assert!(matches!(
+            m.on_key(ev(Key::Char('h'), Some("h"))),
+            Action::ScrollPixel { dx, dy, .. } if dx == -48.0 && dy == 0.0
+        ));
+        assert!(matches!(
+            m.on_key(ev(Key::Char('l'), Some("l"))),
+            Action::ScrollPixel { dx, dy, .. } if dx == 48.0 && dy == 0.0
+        ));
+    }
+
+    #[test]
+    fn capital_l_goes_forward_in_normal_mode() {
+        let mut m = mapper();
+        assert!(matches!(m.on_key(ev(Key::Char('L'), Some("L"))), Action::GoForward));
         assert!(matches!(m.mode, Mode::Normal));
     }
 }

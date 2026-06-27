@@ -261,7 +261,7 @@ impl WebcatMcp {
         control_guard(self.allow_control)?;
         let browser = self.browser().await;
         browser
-            .scroll(p.x.unwrap_or(10.0), p.y.unwrap_or(10.0), p.dy)
+            .scroll(p.x.unwrap_or(10.0), p.y.unwrap_or(10.0), 0.0, p.dy)
             .await
             .map_err(to_err)?;
         Ok(CallToolResult::success(vec![Content::text("ok")]))
